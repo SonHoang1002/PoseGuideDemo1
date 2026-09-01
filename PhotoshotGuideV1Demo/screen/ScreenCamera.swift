@@ -56,14 +56,12 @@ class CameraManager: NSObject, ObservableObject {
 
     // Guidance state
     private var template: Template?
+    private var referenceImage: UIImage?   // ảnh mẫu gốc — cần cho BestShotSelector khi quay video
     private var optics: CameraOptics?
-    private let measurer = Measurer()
+    private let measurer = Measurer(config: .default)
     private let engine = GuidanceEngine()
-    private let trigger = CaptureTrigger()
+    private let trigger = CaptureTrigger(config: .default)
     private let motion = CMMotionManager()
-    private let yawFilter = OneEuroFilter()
-    private let sizeFilter = OneEuroFilter()
-    private let xFilter = OneEuroFilter()
     private var frameCounter = 0
 
     // Burst-capture scoring pool
@@ -72,6 +70,11 @@ class CameraManager: NSObject, ObservableObject {
     private var lastBurstCaptureTime: Double = 0
     private let burstInterval: Double = 0.6
     private let maxScoredCaptures = 60
+
+    // Log tốc độ góc song song lúc quay video — đề xuất bổ sung #2 tài liệu
+    // verify-v3: loại frame chụp lúc máy đang di chuyển, chính xác hơn đoán
+    // nhoè từ ảnh. Xem BestShotSelector.swift / AngularSpeedSample.
+    private var recordingMotionLog: [AngularSpeedSample] = []
 
     override init() {
         super.init()
@@ -180,6 +183,7 @@ class CameraManager: NSObject, ObservableObject {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)
             .appendingPathExtension("mov")
+        recordingMotionLog.removeAll()
         movieOutput.startRecording(to: url, recordingDelegate: self)
         DispatchQueue.main.async { self.isRecording = true }
     }
@@ -192,9 +196,12 @@ class CameraManager: NSObject, ObservableObject {
     // MARK: - Guidance
 
     /// Call whenever the reference/sample image (or a newly picked one) has been analyzed.
-    func startGuidance(template: Template) {
+    /// `referenceImage` is kept for BestShotSelector, which re-analyzes the raw sample
+    /// photo itself when a video finishes recording (it needs a CGImage, not `Template`).
+    func startGuidance(template: Template, referenceImage: UIImage) {
         self.template = template
-        measurer.resetCalibration()
+        self.referenceImage = referenceImage
+        measurer.reset()
         engine.reset()
         trigger.reset()
         motion.deviceMotionUpdateInterval = 1.0 / 60.0
@@ -257,20 +264,28 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         guard let optics else { return }
 
         let orientation: CGImagePropertyOrientation = currentPosition == .front ? .leftMirrored : .right
-        let pitchDeg = (motion.deviceMotion?.attitude.pitch ?? 0).degrees
+        let now = CACurrentMediaTime()
+        // Chưa có mẫu thì tạm dùng .full — chỉ ảnh hưởng các đại lượng suy ra từ
+        // template (scaleValue/centerX/elevationDeg), không ảnh hưởng skeleton
+        // overlay (jointPoints luôn được đo và publish bất kể có mẫu hay chưa).
+        let framing = template?.framing ?? .full
 
-        var m = measurer.measure(pixelBuffer: pixelBuffer,
-                                 attitudePitchDeg: pitchDeg,
+        let m = measurer.measure(pixelBuffer: pixelBuffer,
+                                 deviceMotion: motion.deviceMotion,
                                  optics: optics,
                                  orientation: orientation,
-                                 runFaceThisFrame: runFace)
-
-        let now = CACurrentMediaTime()
-        if let v = m.bodyYawDeg         { m.bodyYawDeg = yawFilter.filter(v, timestamp: now) }
-        if let v = m.subjectHeightRatio { m.subjectHeightRatio = sizeFilter.filter(v, timestamp: now) }
-        if let v = m.hipCenterX         { m.hipCenterX = xFilter.filter(v, timestamp: now) }
+                                 timestamp: now,
+                                 framing: framing,
+                                 runFace: runFace)
 
         lastMeasurement = m
+
+        // Ghi log tốc độ góc song song lúc quay (đề xuất bổ sung #2 tài liệu
+        // verify-v3) — BestShotSelector dùng để loại frame chụp lúc máy rung,
+        // chính xác hơn đoán nhoè từ ảnh.
+        if isRecording {
+            recordingMotionLog.append(AngularSpeedSample(time: now, degPerSec: m.angularSpeedDegPerSec))
+        }
 
         // Always publish the skeleton — independent of whether guidance is running yet.
         DispatchQueue.main.async { [weak self] in
@@ -282,7 +297,7 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         guard let template else { return }
 
         let result = engine.evaluate(m, template, optics)
-        let shouldCapture = trigger.update(isAligned: result.isAligned, now: now)
+        let shouldCapture = trigger.update(ready: result.readyToCapture, now: now)
         let countdownValue = trigger.countdownRemaining
 
         // Burst-capture + score into the temp match pool (throttled, off the main thread).
@@ -304,29 +319,35 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
     }
 }
 
-// Handles a finished video recording: saves the clip to Photos, then extracts frames
-// from the temp file and scores each one against the reference template.
+// Handles a finished video recording: saves the clip to Photos, then hands it to
+// BestShotSelector (Documents/BestShotSelector.swift, tích hợp §7 tài liệu verify-v3)
+// to pick the 5 best-matching, best-quality, diverse frames and crop them to the
+// template's composition.
 extension CameraManager: AVCaptureFileOutputRecordingDelegate {
     func fileOutput(_ output: AVCaptureFileOutput, didFinishRecordingTo outputFileURL: URL, from connections: [AVCaptureConnection], error: Error?) {
         DispatchQueue.main.async {
             self.isRecording = false
             self.lastVideoURL = outputFileURL
         }
-        guard error == nil, let template else { return }
+        let motionLog = recordingMotionLog
+        // BestShotSelector phân tích lại chính ảnh mẫu gốc (nó cần CGImage, không
+        // dùng `Template` của GuidanceEngine — hai bộ phân tích độc lập với nhau).
+        guard error == nil, let referenceImage, let referenceCGImage = referenceImage.cgImage else { return }
 
         UISaveVideoAtPathToSavedPhotosAlbum(outputFileURL.path, nil, nil, nil)
 
         DispatchQueue.main.async { self.isExtractingFrames = true }
         Task {
-            let frames = await VideoFrameExtractor.extractFrames(url: outputFileURL)
-            var newlyScored: [ScoredCapture] = []
-            for frame in frames {
-                guard let frameTemplate = TemplateAnalyzer.analyze(image: frame) else { continue }
-                let score = PoseSimilarity.score(frameTemplate, against: template)
-                newlyScored.append(ScoredCapture(image: frame, score: score))
-            }
+            let selector = BestShotSelector(config: .default)
+            let shots = (try? await selector.selectBestShots(
+                videoURL: outputFileURL,
+                templateImage: referenceCGImage,
+                angularSpeedLog: motionLog
+            )) ?? []
             await MainActor.run {
-                newlyScored.forEach { self.addScoredCapture($0) }
+                for shot in shots {
+                    self.addScoredCapture(ScoredCapture(image: UIImage(cgImage: shot.image), score: shot.score.total))
+                }
                 self.isExtractingFrames = false
                 try? FileManager.default.removeItem(at: outputFileURL) // temp file cleaned up after extraction
             }
@@ -418,7 +439,7 @@ struct CameraScreen: View {
             guard let newImage else { return }
             Task.detached(priority: .userInitiated) {
                 guard let template = TemplateAnalyzer.analyze(image: newImage) else { return }
-                await MainActor.run { cameraManager.startGuidance(template: template) }
+                await MainActor.run { cameraManager.startGuidance(template: template, referenceImage: newImage) }
             }
         }
         .photosPicker(isPresented: $showChangeSample, selection: $samplePickerItem, matching: .images)
