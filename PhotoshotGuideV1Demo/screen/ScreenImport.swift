@@ -1,6 +1,14 @@
 import SwiftUI
 import PhotosUI
 
+/// Các màn hình trong luồng demo. Toàn bộ stack nằm trong MỘT path của
+/// ScreenImport → Result chỉ cần xoá path là quay về đúng màn ban đầu.
+enum AppRoute: Hashable {
+    case camera(referenceImage: UIImage?, properties: [AppliedProperty])
+    case processing(videoURL: URL?, referenceImage: UIImage?)
+    case result(videoURL: URL?, frames: [AnalyzedFrame], referenceImage: UIImage?)
+}
+
 struct ScreenImport: View {
     @State private var pickerItem: PhotosPickerItem?
     @State private var isAnalyzing = false
@@ -9,12 +17,11 @@ struct ScreenImport: View {
     @State private var showCameraRoll = false
     @State private var bottomCaptureState = 0
 
-    @State private var navigateToCamera = false
-    @State private var pendingReferenceImage: UIImage?
-    @State private var pendingProperties: [AppliedProperty] = []
+    // Stack điều hướng trung tâm: append để đi tới, removeAll() để về màn gốc.
+    @State private var path: [AppRoute] = []
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             VStack(spacing: 0) {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 20) {
@@ -48,13 +55,29 @@ struct ScreenImport: View {
             .sheet(isPresented: $showCamera) {
                 // Open system camera with several properties
             }
-            .navigationDestination(isPresented: $navigateToCamera) {
-                // Bug fix: this used to call CameraScreen() with no arguments, so the
-                // chosen sample image and its properties never reached the camera screen.
-                CameraScreen(
-                    referenceImage: pendingReferenceImage,
-                    referenceProperties: pendingProperties
-                )
+            .navigationDestination(for: AppRoute.self) { route in
+                switch route {
+                case let .camera(referenceImage, properties):
+                    CameraScreen(
+                        referenceImage: referenceImage,
+                        referenceProperties: properties,
+                        onNavigate: { path.append($0) },
+                        onFinish: { path.removeAll() }   // back từ Result → về màn chọn mẫu
+                    )
+                case let .processing(videoURL, referenceImage):
+                    ScreenProcessing(
+                        videoURL: videoURL,
+                        referenceImage: referenceImage,
+                        onNavigate: { path.append($0) }
+                    )
+                case let .result(videoURL, frames, referenceImage):
+                    ResultScreen(
+                        videoURL: videoURL,
+                        initialFrames: frames,
+                        referenceImage: referenceImage,
+                        onFinish: { path.removeAll() }
+                    )
+                }
             }
         }
     }
@@ -126,12 +149,13 @@ struct ScreenImport: View {
         .clipShape(RoundedRectangle(cornerRadius: 14))
         .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.black.opacity(0.05), lineWidth: 1))
         .onTapGesture {
-            pendingReferenceImage = UIImage(named: "Template 4")
-            pendingProperties = [
-                AppliedProperty(title: "Hướng mẫu"),
-                AppliedProperty(title: "Máy cao thấp")
-            ]
-            navigateToCamera = true
+            path.append(.camera(
+                referenceImage: UIImage(named: "Template 4"),
+                properties: [
+                    AppliedProperty(title: "Hướng mẫu"),
+                    AppliedProperty(title: "Máy cao thấp")
+                ]
+            ))
         }
     }
 
@@ -163,12 +187,13 @@ struct ScreenImport: View {
         // ... analysis work ...
 
         isAnalyzing = false
-        pendingReferenceImage = image
-        pendingProperties = [
-            AppliedProperty(title: "Hướng mẫu"),
-            AppliedProperty(title: "Máy cao thấp")
-        ]
-        navigateToCamera = true
+        path.append(.camera(
+            referenceImage: image,
+            properties: [
+                AppliedProperty(title: "Hướng mẫu"),
+                AppliedProperty(title: "Máy cao thấp")
+            ]
+        ))
     }
 }
 

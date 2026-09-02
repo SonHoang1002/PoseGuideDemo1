@@ -1,7 +1,7 @@
 import Foundation
 import UIKit
 
-final class LocalCacheManager {
+nonisolated final class LocalCacheManager {
     static let shared = LocalCacheManager()
 
     let directory: URL
@@ -9,6 +9,11 @@ final class LocalCacheManager {
     private init() {
         directory = FileManager.default.temporaryDirectory.appendingPathComponent("PhotoshotCache", isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        // File còn sót lại chỉ có thể từ lần chạy trước (app đã exit hoàn toàn) → dọn ngay.
+        clearAll()
+
+        // Dọn toàn bộ cache khi app kết thúc hẳn.
         NotificationCenter.default.addObserver(self, selector: #selector(clearAll),
                                                 name: UIApplication.willTerminateNotification, object: nil)
     }

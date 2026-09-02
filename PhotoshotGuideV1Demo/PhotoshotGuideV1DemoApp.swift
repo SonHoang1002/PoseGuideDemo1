@@ -9,6 +9,10 @@ import SwiftUI
 
 @main
 struct PhotoshotGuideV1DemoApp: App {
+    init() {
+        _ = LocalCacheManager.shared
+    }
+
     var body: some Scene {
         WindowGroup {
             ScreenImport()

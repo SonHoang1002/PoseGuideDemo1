@@ -1,21 +1,22 @@
 import SwiftUI
 
 struct ScreenProcessing: View {
-    // Giả lập tiến trình
-    var progress: Double = 0.6
-    
+    let videoURL: URL?
+    let referenceImage: UIImage?
+    /// Đẩy màn Result qua path trung tâm của ScreenImport.
+    let onNavigate: (AppRoute) -> Void
+
+    @State private var progress: Double = 0
+    @State private var stageText = "Đang trích xuất khung hình…"
+    @State private var hasNavigated = false
+
     var body: some View {
         ZStack {
-            // 1. Background full màn hình
             Color.white.ignoresSafeArea()
-            
-            // 2. Nội dung chính nằm chính xác ở giữa
+
             VStack(spacing: 24) {
-                Spacer() // Đẩy nội dung xuống giữa theo trục dọc
-                
-                // ------- Phần xử lý ảnh (Processing View) -------
-                
-                // 1. Biểu tượng (Icon)
+                Spacer()
+
                 ZStack {
                     Circle()
                         .fill(
@@ -27,27 +28,78 @@ struct ScreenProcessing: View {
                         )
                         .frame(width: 80, height: 80)
                         .shadow(color: Color.blue.opacity(0.3), radius: 10, x: 0, y: 6)
-                    
+
                     Image(systemName: "wand.and.stars")
                         .foregroundColor(.white)
                         .font(.system(size: 36, weight: .medium))
                 }
-                
-                // 2. Tiêu đề
-                Text("Đang xử lý ảnh")
+                .rotationEffect(.degrees(isWorking ? 360 : 0))
+                .animation(isWorking ? .linear(duration: 3).repeatForever(autoreverses: false) : .default,
+                           value: isWorking)
+
+                Text("Đang xử lý video")
                     .font(.system(size: 22, weight: .bold))
                     .foregroundColor(Color(red: 0.1, green: 0.1, blue: 0.15))
-                
-                // 3. Thanh tiến trình
+
+                Text(stageText)
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundColor(.secondary)
+
                 CustomProgressBar(value: progress, total: 1.0)
                     .frame(width: 260, height: 12)
-                
-                // ------- Hết phần xử lý ảnh -------
-                
-                Spacer() // Đẩy nội dung lên giữa theo trục dọc
+
+                Text("\(Int((progress * 100).rounded()))%")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(Color(hex: "2C65E7"))
+                    .monospacedDigit()
+
+                Spacer()
             }
-            .padding(40) // Tạo khoảng cách lề 2 bên để giao diện không sát cạnh quá mức
+            .padding(40)
         }
+        .navigationBarBackButtonHidden(true)
+        .task { await runAnalysis() }
+    }
+
+    private var isWorking: Bool { !hasNavigated }
+
+    private func runAnalysis() async {
+        let frames: [AnalyzedFrame]
+        if let videoURL {
+            frames = await FrameAnalysisPipeline.run(
+                videoURL: videoURL,
+                interval: 0.5,
+                referenceImage: referenceImage
+            ) { frac in
+                Task { @MainActor in
+                    updateStage(for: frac)
+                }
+            }
+        } else {
+            updateStage(for: 1.0)
+            frames = []
+        }
+        finish(frames: frames)
+    }
+
+    private func updateStage(for value: Double) {
+        withAnimation(.easeInOut) { progress = value }
+        if value < 0.55 {
+            stageText = "Đang trích xuất khung hình…"
+        } else if value < 0.97 {
+            stageText = "Đang lọc khung đúng tư thế mẫu · chấm điểm độ nét…"
+        } else {
+            stageText = "Đang chọn 5 khung hình tốt nhất…"
+        }
+    }
+
+    private func finish(frames: [AnalyzedFrame]) {
+        updateStage(for: 1.0)
+        guard !hasNavigated else { return }
+        hasNavigated = true
+        onNavigate(.result(videoURL: videoURL,
+                           frames: frames,
+                           referenceImage: referenceImage))
     }
 }
 
@@ -55,13 +107,13 @@ struct ScreenProcessing: View {
 struct CustomProgressBar: View {
     var value: Double
     var total: Double
-    
+
     var body: some View {
         GeometryReader { geometry in
             ZStack(alignment: .leading) {
                 Capsule()
                     .fill(Color(red: 0.91, green: 0.94, blue: 0.96))
-                
+
                 Capsule()
                     .fill(
                         LinearGradient(
@@ -106,5 +158,7 @@ extension Color {
 
 // Preview
 #Preview {
-    ScreenProcessing()
+    NavigationStack {
+        ScreenProcessing(videoURL: nil, referenceImage: nil, onNavigate: { _ in })
+    }
 }

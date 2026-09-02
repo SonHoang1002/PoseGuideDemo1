@@ -257,6 +257,7 @@
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSCameraUsageDescription = "Sử dụng camera";
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Cần quyền lưu ảnh/video vào Thư viện ảnh để bạn có thể xem lại sau khi chụp.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -290,6 +291,7 @@
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSCameraUsageDescription = "Sử dụng camera";
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Cần quyền lưu ảnh/video vào Thư viện ảnh để bạn có thể xem lại sau khi chụp.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;

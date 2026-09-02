@@ -1,14 +1,19 @@
 import SwiftUI
 import AVFoundation
 import CoreMotion
+import CoreMedia
 import Vision
 import PhotosUI
 import UIKit
 internal import Combine
 
+/// Key attachment của CMSampleBuffer chứa ma trận intrinsic 3x3 (48 byte simd_float3x3).
+/// Không được expose sang Swift nên khai báo lại đúng giá trị trong CMSampleBuffer.h.
+private let kCameraIntrinsicDataKey = "CameraIntrinsicData" as CFString
+
 // MARK: - Models
 
-struct AppliedProperty: Identifiable, Equatable {
+struct AppliedProperty: Identifiable, Equatable, Hashable {
     let id = UUID()
     let title: String
 }
@@ -30,9 +35,28 @@ class CameraManager: NSObject, ObservableObject {
 
     // Guidance pipeline output
     @Published var guidanceResult: GuidanceResult?
+    /// Cue đã qua CuePresenter (chống nhảy mục + nhảy số) — UI nên ưu tiên cái này.
+    @Published var stableCue: String?
+    /// true khi ảnh mẫu không phân tích được người → hướng dẫn không thể chạy.
+    @Published var isTemplateMissing = false
+    /// Điểm khớp của ảnh mẫu để vẽ khung mẫu (ghost) lên preview.
+    @Published var templateGhostJoints: [VNHumanBodyPoseObservation.JointName: CGPoint]?
+    /// Tỉ lệ w/h của ảnh mẫu — ghost được aspect-fit theo tỉ lệ này.
+    @Published var templateSampleAspect: Double?
+    /// Lớp khung hình + mode (full / upper) suy từ ảnh mẫu — driver cho dialog & UI.
+    @Published var templateFraming: FramingClass?
+    @Published var templateCaptureMode: CaptureMode?
+    /// Hiện dialog 1 lần khi mẫu là khung hình PARTIAL (chỉ lấy phần trên cơ thể).
+    private var didShowPartialNotice = false
+    @Published var showPartialTemplateNotice = false
+    /// Chế độ chân dung: khung VUÔNG, chỉ lấy phần TRÊN của người. Bật bằng nút trên UI.
+    @Published var isPortraitMode = false
     @Published var countdown: Int?
     @Published var jointPoints: [VNHumanBodyPoseObservation.JointName: JointPoint]?
     @Published var detectedJointCount: Int = 0
+    /// true khi frame hiện tại đo ĐỦ khớp thân để chạy hướng dẫn (khác với
+    /// "có vẽ skeleton" — vẽ chỉ cần confidence ≥ mức hiển thị rất thấp).
+    @Published var hasLiveSubject = false
 
     // Manually-tapped "keeper" shots (shown at bottom-left)
     @Published var lastCapturedImage: UIImage?
@@ -44,7 +68,13 @@ class CameraManager: NSObject, ObservableObject {
     // Video mode
     @Published var isRecording = false
     @Published var lastVideoURL: URL?
-    @Published var isExtractingFrames = false
+    @Published var recordCountdown: Int?
+
+    // Pinch-to-zoom
+    @Published var currentZoomFactor: CGFloat = 1.0
+    private var zoomGestureStartFactor: CGFloat = 1.0
+
+    static let maxRecordSeconds = 30
 
     private var photoOutput = AVCapturePhotoOutput()
     private let videoDataOutput = AVCaptureVideoDataOutput()
@@ -54,16 +84,16 @@ class CameraManager: NSObject, ObservableObject {
     private var activeDevice: AVCaptureDevice?
     private var currentPosition: AVCaptureDevice.Position = .back
 
-    // Guidance state
+    // Guidance state — mọi ngưỡng nằm trong GuidanceConfig (v2)
+    private let guidanceConfig = GuidanceConfig()
     private var template: Template?
     private var optics: CameraOptics?
-    private let measurer = Measurer()
-    private let engine = GuidanceEngine()
-    private let trigger = CaptureTrigger()
+    private var triedEnablingIntrinsics = false
+    private lazy var measurer = Measurer(config: guidanceConfig)
+    private lazy var engine = GuidanceEngine(config: guidanceConfig)
+    private lazy var trigger = CaptureTrigger(config: guidanceConfig)
     private let motion = CMMotionManager()
-    private let yawFilter = OneEuroFilter()
-    private let sizeFilter = OneEuroFilter()
-    private let xFilter = OneEuroFilter()
+    private var countdownTimer: Timer?
     private var frameCounter = 0
 
     // Burst-capture scoring pool
@@ -72,6 +102,68 @@ class CameraManager: NSObject, ObservableObject {
     private var lastBurstCaptureTime: Double = 0
     private let burstInterval: Double = 0.6
     private let maxScoredCaptures = 60
+
+    // MARK: - Chế độ chân dung (khung vuông, lấy phần trên người)
+
+    /// Khung vuông chân dung theo toạ độ CHUẨN HOÁ của toàn vùng preview (0...1).
+    /// Được CameraScreen cập nhật mỗi khi kích thước màn hình đổi.
+    var portraitCropNormalized: CGRect?
+    /// Tỉ lệ w/h của vùng preview — dùng để quy khung màn hình sang pixel ảnh
+    /// (preview hiển thị aspect-FILL nên phải trừ phần ảnh bị crop khỏi màn hình).
+    var previewViewAspect: CGFloat?
+
+    private static let portraitSideInset: CGFloat = 14      // lề hai bên khung vuông
+    private static let portraitTopFraction: CGFloat = 0.14  // đỉnh khung cách mép trên
+
+    func updatePortraitLayout(viewSize: CGSize) {
+        guard viewSize.width > 0, viewSize.height > 0 else { return }
+        previewViewAspect = viewSize.width / viewSize.height
+        let side = min(viewSize.width - Self.portraitSideInset * 2,
+                       viewSize.height * 0.55)
+        let x = (viewSize.width - side) / 2
+        let y = viewSize.height * Self.portraitTopFraction
+        portraitCropNormalized = CGRect(x: x / viewSize.width,
+                                        y: y / viewSize.height,
+                                        width: side / viewSize.width,
+                                        height: side / viewSize.height)
+    }
+
+    /// Quy khung chuẩn hoá TRÊN MÀN HÌNH sang pixel của ảnh, tính đúng phần ảnh
+    /// bị aspect-fill cắt mất (đây là chỗ khiến crop khớp với những gì user thấy).
+    static func cropRect(normalizedViewRect: CGRect,
+                         viewAspect: CGFloat,
+                         imageSize: CGSize) -> CGRect {
+        let bufferAspect = imageSize.width / imageSize.height
+        var uRange: CGFloat = 1, vRange: CGFloat = 1   // độ dài vùng ảnh HIỂN THỊ được
+        var u0: CGFloat = 0, v0: CGFloat = 0
+        if bufferAspect > viewAspect {
+            uRange = viewAspect / bufferAspect         // ảnh rộng hơn → crop trái/phải
+            u0 = (1 - uRange) / 2
+        } else {
+            vRange = bufferAspect / viewAspect         // ảnh cao hơn → crop trên/dưới
+            v0 = (1 - vRange) / 2
+        }
+        let x = (normalizedViewRect.minX - u0) / uRange * imageSize.width
+        let y = (normalizedViewRect.minY - v0) / vRange * imageSize.height
+        let w = normalizedViewRect.width / uRange * imageSize.width
+        let h = normalizedViewRect.height / vRange * imageSize.height
+        return CGRect(x: x, y: y, width: w, height: h)
+            .intersection(CGRect(origin: .zero, size: imageSize))
+    }
+
+    /// Cắt ảnh về khung chân dung nếu mode đang bật; ngược lại trả nguyên bản.
+    private func applyPortraitCropIfNeeded(_ image: UIImage) -> UIImage {
+        guard isPortraitMode,
+              let nRect = portraitCropNormalized,
+              let aspect = previewViewAspect else { return image }
+        let rect = Self.cropRect(normalizedViewRect: nRect,
+                                 viewAspect: aspect,
+                                 imageSize: image.size)
+        guard rect.width >= 40, rect.height >= 40 else { return image }
+        return UIGraphicsImageRenderer(size: rect.size).image { _ in
+            image.draw(at: CGPoint(x: -rect.minX, y: -rect.minY))
+        }
+    }
 
     override init() {
         super.init()
@@ -96,6 +188,13 @@ class CameraManager: NSObject, ObservableObject {
     }
 
     private func setupSession() {
+        // Vector trọng lực cần chạy NGAY từ đầu: pitch (mục 4) phụ thuộc nó.
+        // Nếu chỉ bật trong startGuidance thì template phân tích fail → mất luôn cảm biến.
+        motion.deviceMotionUpdateInterval = 1.0 / 60.0
+        if motion.isDeviceMotionAvailable, !motion.isDeviceMotionActive {
+            motion.startDeviceMotionUpdates()
+        }
+
         session.beginConfiguration()
         // .high (not .photo) so photo capture, live pose analysis, and movie recording
         // can all share the same session.
@@ -152,10 +251,50 @@ class CameraManager: NSObject, ObservableObject {
             activeDevice = newCamera
             currentPosition = newPosition
             optics = nil
+            // New physical device → its zoom range is independent, reset baseline.
+            currentZoomFactor = 1.0
+            zoomGestureStartFactor = 1.0
         } else {
             session.addInput(currentInput)
         }
         session.commitConfiguration()
+    }
+
+    // MARK: - Zoom
+
+    var minZoomFactor: CGFloat {
+        activeDevice?.minAvailableVideoZoomFactor ?? 1.0
+    }
+
+    var maxZoomFactor: CGFloat {
+        guard let device = activeDevice else { return 1.0 }
+        // Some devices report absurdly high max factors (100x+) where image quality is
+        // unusable well before that — cap to something sane for a pinch gesture.
+        return min(device.maxAvailableVideoZoomFactor, 8.0)
+    }
+
+    /// Call when a pinch gesture begins, so the next gesture is relative to the current zoom
+    /// rather than snapping back to 1.0x.
+    func beginZoomGesture() {
+        zoomGestureStartFactor = currentZoomFactor
+    }
+
+    /// Call continuously with MagnificationGesture's `value` (a multiplier starting at 1.0).
+    func updateZoomGesture(scale: CGFloat) {
+        setZoom(factor: zoomGestureStartFactor * scale)
+    }
+
+    func setZoom(factor: CGFloat) {
+        guard let device = activeDevice else { return }
+        let clamped = min(max(factor, minZoomFactor), maxZoomFactor)
+        do {
+            try device.lockForConfiguration()
+            device.videoZoomFactor = clamped
+            device.unlockForConfiguration()
+            DispatchQueue.main.async { self.currentZoomFactor = clamped }
+        } catch {
+            // Silently ignore — zoom just won't update this frame.
+        }
     }
 
     // MARK: - Photo capture
@@ -164,12 +303,15 @@ class CameraManager: NSObject, ObservableObject {
         let settings = AVCapturePhotoSettings()
         photoOutput.capturePhoto(with: settings, delegate: PhotoCaptureDelegate { [weak self] image in
             guard let self, let image else { completion(image); return }
+            // Chế độ chân dung: cắt về khung vuông NGAY tại đây để cả ảnh lưu,
+            // ảnh hiện thumbnail và ảnh vào pool điểm số đều là bản đã cắt.
+            let finalImage = applyPortraitCropIfNeeded(image)
             // A manual tap also gets scored so it competes fairly for the top-5 pool.
             if let m = self.lastMeasurement, let template = self.template {
                 let score = PoseSimilarity.score(m, template)
-                DispatchQueue.main.async { self.addScoredCapture(ScoredCapture(image: image, score: score)) }
+                DispatchQueue.main.async { self.addScoredCapture(ScoredCapture(image: finalImage, score: score)) }
             }
-            completion(image)
+            completion(finalImage)
         })
     }
 
@@ -181,12 +323,42 @@ class CameraManager: NSObject, ObservableObject {
             .appendingPathComponent(UUID().uuidString)
             .appendingPathExtension("mov")
         movieOutput.startRecording(to: url, recordingDelegate: self)
-        DispatchQueue.main.async { self.isRecording = true }
+        DispatchQueue.main.async {
+            self.isRecording = true
+            self.startRecordCountdown()
+        }
     }
 
     func stopRecording() {
         guard movieOutput.isRecording else { return }
+        DispatchQueue.main.async {
+            self.cancelRecordCountdown()
+        }
         movieOutput.stopRecording()
+    }
+
+    /// Đếm ngược 30 giây khi bắt đầu ghi; về 0 thì tự động dừng.
+    private func startRecordCountdown() {
+        cancelRecordCountdown()
+        var remaining = Self.maxRecordSeconds
+        recordCountdown = remaining
+        countdownTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] timer in
+            guard let self else { timer.invalidate(); return }
+            remaining -= 1
+            if remaining <= 0 {
+                timer.invalidate()
+                self.recordCountdown = nil
+                self.stopRecording()
+            } else {
+                self.recordCountdown = remaining
+            }
+        }
+    }
+
+    private func cancelRecordCountdown() {
+        countdownTimer?.invalidate()
+        countdownTimer = nil
+        recordCountdown = nil
     }
 
     // MARK: - Guidance
@@ -194,7 +366,17 @@ class CameraManager: NSObject, ObservableObject {
     /// Call whenever the reference/sample image (or a newly picked one) has been analyzed.
     func startGuidance(template: Template) {
         self.template = template
-        measurer.resetCalibration()
+        // Dữ liệu vẽ khung mẫu (ghost) cho người chụp ướm người vào.
+        templateGhostJoints = template.ghostJoints
+        templateSampleAspect = template.sampleAspectRatio
+        templateFraming = template.framing
+        templateCaptureMode = template.captureMode
+        // Dialog "chỉ lấy phần trên cơ thể" — báo 1 lần mỗi phiên camera khi mẫu là PARTIAL.
+        if template.captureMode == .upper, !didShowPartialNotice {
+            didShowPartialNotice = true
+            showPartialTemplateNotice = true
+        }
+        measurer.reset()
         engine.reset()
         trigger.reset()
         motion.deviceMotionUpdateInterval = 1.0 / 60.0
@@ -206,7 +388,13 @@ class CameraManager: NSObject, ObservableObject {
     /// Best N frames captured so far (live burst + manual taps + extracted video frames),
     /// ranked by closeness to the reference pose.
     func topMatches(_ n: Int = 5) -> [UIImage] {
-        scoredCaptures.sorted { $0.score > $1.score }.prefix(n).map(\.image)
+        topScoredMatches(n).map(\.image)
+    }
+
+    /// Same as `topMatches` but keeps each frame's pose score, so downstream screens
+    /// can blend it with frame quality instead of guessing a neutral 0.5.
+    func topScoredMatches(_ n: Int = 5) -> [ScoredCapture] {
+        Array(scoredCaptures.sorted { $0.score > $1.score }.prefix(n))
     }
 
     private func addScoredCapture(_ capture: ScoredCapture) {
@@ -220,11 +408,11 @@ class CameraManager: NSObject, ObservableObject {
     private func handleAutoCapture() {
         capturePhoto { [weak self] image in
             guard let self, let image else { return }
+            LocalCacheManager.shared.saveImage(image)
             DispatchQueue.main.async {
                 self.lastCapturedImage = image
                 self.capturedItems.append(image)
             }
-            UIImageWriteToSavedPhotosAlbum(image, nil, nil, nil)
         }
     }
 
@@ -247,28 +435,48 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
         frameCounter += 1
-        let runFace = frameCounter % 3 == 0
+        let cfg = guidanceConfig
+        let runFace = frameCounter % max(1, cfg.faceEveryNFrames) == 0
 
-        if optics == nil, let device = activeDevice {
+        // Bật giao intrinsics 1 lần — tiêu cự thật từ cảm biến (chính xác hơn videoFieldOfView).
+        if !triedEnablingIntrinsics {
+            triedEnablingIntrinsics = true
+            if let connection = videoDataOutput.connection(with: .video),
+               connection.isCameraIntrinsicMatrixDeliverySupported {
+                connection.isCameraIntrinsicMatrixDeliveryEnabled = true
+            }
+        }
+
+        if optics == nil {
             let w = CVPixelBufferGetWidth(pixelBuffer), h = CVPixelBufferGetHeight(pixelBuffer)
+            // Buffer cảm biến là landscape; quy về dạng DỌC cho thống nhất với Vision.
             let portraitSize = CGSize(width: CGFloat(min(w, h)), height: CGFloat(max(w, h)))
-            optics = CameraOptics(device: device, imageSize: portraitSize)
+            var mode: CMAttachmentMode = 0
+            if let cf = CMGetAttachment(sampleBuffer,
+                                        key: kCameraIntrinsicDataKey,
+                                        attachmentModeOut: &mode),
+               let data = cf as? Data,
+               data.count == MemoryLayout<simd_float3x3>.size {
+                // Rotation chỉ đổi w/h, tiêu cự giữ nguyên → fy dùng trực tiếp với kích thước dọc.
+                let k = data.withUnsafeBytes { $0.load(as: simd_float3x3.self) }
+                optics = CameraOptics(intrinsics: k, imageSize: portraitSize)
+            } else if let device = activeDevice {
+                optics = CameraOptics(device: device, imageSize: portraitSize)
+            }
         }
         guard let optics else { return }
 
         let orientation: CGImagePropertyOrientation = currentPosition == .front ? .leftMirrored : .right
-        let pitchDeg = (motion.deviceMotion?.attitude.pitch ?? 0).degrees
 
-        var m = measurer.measure(pixelBuffer: pixelBuffer,
-                                 attitudePitchDeg: pitchDeg,
+        // v2: pitch lấy từ VECTOR TRỌNG LỰC + mọi bộ lọc nằm trong Measurer.
+        let now = CACurrentMediaTime()
+        let m = measurer.measure(pixelBuffer: pixelBuffer,
+                                 deviceMotion: motion.deviceMotion,
                                  optics: optics,
                                  orientation: orientation,
-                                 runFaceThisFrame: runFace)
-
-        let now = CACurrentMediaTime()
-        if let v = m.bodyYawDeg         { m.bodyYawDeg = yawFilter.filter(v, timestamp: now) }
-        if let v = m.subjectHeightRatio { m.subjectHeightRatio = sizeFilter.filter(v, timestamp: now) }
-        if let v = m.hipCenterX         { m.hipCenterX = xFilter.filter(v, timestamp: now) }
+                                 timestamp: now,
+                                 runFace: runFace,
+                                 framing: template?.framing ?? .full)
 
         lastMeasurement = m
 
@@ -276,13 +484,17 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         DispatchQueue.main.async { [weak self] in
             self?.jointPoints = m.jointPoints
             self?.detectedJointCount = m.jointPoints.count
+            self?.hasLiveSubject = m.hasSubject
         }
 
         // Everything below needs a reference template; skip it gracefully if there isn't one yet.
         guard let template else { return }
 
         let result = engine.evaluate(m, template, optics)
-        let shouldCapture = trigger.update(isAligned: result.isAligned, now: now)
+        // Đang lắc mạnh → đóng băng cue cũ (user đang di chuyển theo hướng dẫn).
+        let frozen = m.angularSpeedDegPerSec > cfg.freezeCueAngularSpeedDegPerSec
+        let stable = engine.stablePrimaryCue(for: result, now: now, frozen: frozen)
+        let shouldCapture = trigger.update(ready: result.readyToCapture, now: now)
         let countdownValue = trigger.countdownRemaining
 
         // Burst-capture + score into the temp match pool (throttled, off the main thread).
@@ -290,45 +502,41 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
            let uiImage = imageFromPixelBuffer(pixelBuffer, orientation: orientation) {
             lastBurstCaptureTime = now
             let score = PoseSimilarity.score(m, template)
+            let finalImage = applyPortraitCropIfNeeded(uiImage)
             DispatchQueue.main.async { [weak self] in
-                self?.addScoredCapture(ScoredCapture(image: uiImage, score: score))
+                self?.addScoredCapture(ScoredCapture(image: finalImage, score: score))
             }
         }
 
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.guidanceResult = result
+            self.stableCue = stable
             self.countdown = countdownValue
             if shouldCapture { self.handleAutoCapture() }
         }
     }
 }
 
-// Handles a finished video recording: saves the clip to Photos, then extracts frames
-// from the temp file and scores each one against the reference template.
+// Handles a finished video recording: copies the clip into the app-local cache
+// (lives only while the app is running, wiped on exit) and hands the cached URL to
+// the processing screen, which extracts + scores frames.
 extension CameraManager: AVCaptureFileOutputRecordingDelegate {
     func fileOutput(_ output: AVCaptureFileOutput, didFinishRecordingTo outputFileURL: URL, from connections: [AVCaptureConnection], error: Error?) {
-        DispatchQueue.main.async {
-            self.isRecording = false
-            self.lastVideoURL = outputFileURL
+        guard error == nil else {
+            DispatchQueue.main.async { self.isRecording = false }
+            try? FileManager.default.removeItem(at: outputFileURL)
+            return
         }
-        guard error == nil, let template else { return }
 
-        UISaveVideoAtPathToSavedPhotosAlbum(outputFileURL.path, nil, nil, nil)
-
-        DispatchQueue.main.async { self.isExtractingFrames = true }
-        Task {
-            let frames = await VideoFrameExtractor.extractFrames(url: outputFileURL)
-            var newlyScored: [ScoredCapture] = []
-            for frame in frames {
-                guard let frameTemplate = TemplateAnalyzer.analyze(image: frame) else { continue }
-                let score = PoseSimilarity.score(frameTemplate, against: template)
-                newlyScored.append(ScoredCapture(image: frame, score: score))
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let savedURL = LocalCacheManager.shared.saveVideo(at: outputFileURL) ?? outputFileURL
+            if savedURL != outputFileURL {
+                try? FileManager.default.removeItem(at: outputFileURL)
             }
-            await MainActor.run {
-                newlyScored.forEach { self.addScoredCapture($0) }
-                self.isExtractingFrames = false
-                try? FileManager.default.removeItem(at: outputFileURL) // temp file cleaned up after extraction
+            DispatchQueue.main.async {
+                self?.isRecording = false
+                self?.lastVideoURL = savedURL
             }
         }
     }
@@ -380,23 +588,37 @@ struct CameraScreen: View {
 
     let initialReferenceImage: UIImage?
     let referenceProperties: [AppliedProperty]
+    /// Đẩy màn tiếp theo qua path trung tâm của ScreenImport (Processing / Result).
+    let onNavigate: (AppRoute) -> Void
+    /// Kết thúc phiên → xoá sạch path, về màn ban đầu để chọn mẫu khác.
+    let onFinish: () -> Void
 
     @State private var mode: Int = 1 // 0 = Video, 1 = Photo
     @State private var currentReferenceImage: UIImage?
     @State private var appliedProperties: [AppliedProperty] = []
     @State private var showPreviewGrid: Bool = false
-    @State private var showResult: Bool = false
     @State private var showBodyPoints: Bool = true
+    // Khung mẫu (ghost) từ ảnh mẫu — bật mặc định, tắt bằng nút trên màn hình.
+    @State private var showPoseGuide: Bool = true
 
     // Changing the sample photo from inside the camera screen
     @State private var showChangeSample = false
     @State private var samplePickerItem: PhotosPickerItem?
 
+    // Pinch-to-zoom badge
+    @State private var showZoomBadge = false
+    @State private var zoomBadgeHideTask: Task<Void, Never>?
+
     @StateObject private var cameraManager = CameraManager()
 
-    init(referenceImage: UIImage? = nil, referenceProperties: [AppliedProperty] = []) {
+    init(referenceImage: UIImage? = nil,
+         referenceProperties: [AppliedProperty] = [],
+         onNavigate: @escaping (AppRoute) -> Void = { _ in },
+         onFinish: @escaping () -> Void = {}) {
         self.initialReferenceImage = referenceImage
         self.referenceProperties = referenceProperties
+        self.onNavigate = onNavigate
+        self.onFinish = onFinish
     }
 
     var body: some View {
@@ -416,9 +638,13 @@ struct CameraScreen: View {
         }
         .onChange(of: currentReferenceImage) { _, newImage in
             guard let newImage else { return }
+            cameraManager.isTemplateMissing = false
             Task.detached(priority: .userInitiated) {
-                guard let template = TemplateAnalyzer.analyze(image: newImage) else { return }
-                await MainActor.run { cameraManager.startGuidance(template: template) }
+                if let template = TemplateAnalyzer.analyze(image: newImage) {
+                    await MainActor.run { cameraManager.startGuidance(template: template) }
+                } else {
+                    await MainActor.run { cameraManager.isTemplateMissing = true }
+                }
             }
         }
         .photosPicker(isPresented: $showChangeSample, selection: $samplePickerItem, matching: .images)
@@ -430,18 +656,63 @@ struct CameraScreen: View {
                 await MainActor.run { currentReferenceImage = image }
             }
         }
-        .navigationDestination(isPresented: $showResult) {
-            ResultScreen(images: cameraManager.topMatches(5))
+        // Ghi xong video → tự động sang màn Processing để trích xuất + chấm điểm khung hình
+        .onChange(of: cameraManager.lastVideoURL) { _, newURL in
+            guard let newURL else { return }
+            onNavigate(.processing(videoURL: newURL, referenceImage: currentReferenceImage))
         }
     }
 
     private var cameraContent: some View {
         ZStack {
-            CameraPreviewView(session: cameraManager.session)
-                .ignoresSafeArea()
+            // GeometryReader phủ toàn màn hình (kể cả safe area) để tính khung chân
+            // dung theo đúng hệ toạ độ của preview layer.
+            GeometryReader { geo in
+                CameraPreviewView(session: cameraManager.session)
+                    .onAppear {
+                        cameraManager.updatePortraitLayout(viewSize: geo.size)
+                    }
+                    .onChange(of: geo.size) { _, newSize in
+                        cameraManager.updatePortraitLayout(viewSize: newSize)
+                    }
+            }
+            .ignoresSafeArea()
+            // Two-finger pinch to zoom. Kept directly on the preview layer (not on the
+            // outer ZStack) so it doesn't fight with sheet/nav-swipe gestures elsewhere
+            // on screen.
+            .gesture(
+                MagnificationGesture()
+                    .onChanged { value in
+                        cameraManager.updateZoomGesture(scale: value)
+                        flashZoomBadge()
+                    }
+                    .onEnded { _ in
+                        cameraManager.beginZoomGesture()
+                    }
+            )
 
             if showBodyPoints {
                 SkeletonOverlayView(jointPoints: cameraManager.jointPoints)
+                    .ignoresSafeArea()
+                    // Explicit here too (SkeletonOverlayView already sets this internally):
+                    // this view sits directly on top of the preview layer, so it must never
+                    // intercept touches or the pinch gesture below it would silently stop
+                    // working the moment a body is detected.
+                    .allowsHitTesting(false)
+            }
+
+            // Khung mẫu từ ảnh mẫu — người chụp ướm người thật vào khung này.
+            if showPoseGuide,
+               let ghostJoints = cameraManager.templateGhostJoints,
+               let sampleAspect = cameraManager.templateSampleAspect {
+                TemplateGhostOverlayView(joints: ghostJoints, sampleAspect: sampleAspect)
+                    .ignoresSafeArea()
+            }
+
+            // Chế độ chân dung: làm tối ngoài khung vuông, chỉ lấy phần trên người.
+            if cameraManager.isPortraitMode,
+               let squareRect = cameraManager.portraitCropNormalized {
+                PortraitFrameOverlayView(square: squareRect)
                     .ignoresSafeArea()
             }
 
@@ -454,9 +725,23 @@ struct CameraScreen: View {
                     }
                     .padding(.top, 6)
                 }
+                // Bảng gợi ý LIÊN TỤC theo 6 tiêu chí — mỗi mục tự có câu hướng dẫn
+                // riêng, không phụ thuộc mục ưu tiên cao nhất đang hiển thị ở pill dưới.
+                if currentReferenceImage != nil && !cameraManager.isTemplateMissing {
+                    HStack(alignment: .top) {
+                        criteriaChecklist
+                        Spacer()
+                    }
+                    .padding(.top, 6)
+                }
+                if cameraManager.recordCountdown != nil {
+                    recordCountdownPill.padding(.top, 10)
+                }
                 Spacer()
-                if cameraManager.isExtractingFrames {
-                    extractingBanner.padding(.bottom, 8)
+                if showZoomBadge {
+                    zoomBadge
+                        .transition(.opacity)
+                        .padding(.bottom, 8)
                 }
                 guidancePill.padding(.bottom, 12)
                 modeSwitcher.padding(.bottom, 16)
@@ -464,10 +749,82 @@ struct CameraScreen: View {
             }
             .padding(.horizontal, 16)
             .padding(.top, 16)
+
+            // Số đếm lớn khi còn ≤5 giây cuối của 30s ghi hình
+            if let seconds = cameraManager.recordCountdown, seconds <= 5 {
+                Text("\(seconds)")
+                    .font(.system(size: 130, weight: .heavy))
+                    .foregroundColor(.white.opacity(0.75))
+                    .shadow(color: .black.opacity(0.4), radius: 8)
+                    .id(seconds)
+                    .transition(.scale(scale: 1.4).combined(with: .opacity))
+                    .animation(.easeOut(duration: 0.3), value: cameraManager.recordCountdown)
+            }
         }
         .sheet(isPresented: $showPreviewGrid) {
             PreviewGridView(capturedItems: cameraManager.capturedItems)
         }
+        .alert("Chỉ lấy phần trên cơ thể", isPresented: $cameraManager.showPartialTemplateNotice) {
+            Button("Đã hiểu") { }
+        } message: {
+            Text("Mẫu của bạn là khung hình bán thân (chân dung). Hướng dẫn chỉ chấm phần trên cơ thể; hãy ướm người thật vào khung hình được hiển thị.")
+        }
+    }
+
+    // Small pill showing the current zoom factor, flashed while pinching and faded out
+    // shortly after the gesture stops.
+    private var zoomBadge: some View {
+        Text(String(format: "%.1fx", cameraManager.currentZoomFactor))
+            .font(.system(size: 13, weight: .bold))
+            .monospacedDigit()
+            .foregroundColor(.white)
+            .padding(.vertical, 6)
+            .padding(.horizontal, 14)
+            .background(Capsule().fill(Color.black.opacity(0.55)))
+    }
+
+    private func flashZoomBadge() {
+        withAnimation(.easeOut(duration: 0.15)) { showZoomBadge = true }
+        zoomBadgeHideTask?.cancel()
+        zoomBadgeHideTask = Task {
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                withAnimation(.easeOut(duration: 0.25)) { showZoomBadge = false }
+            }
+        }
+    }
+
+    // Pill hiển thị thời gian ghi + đếm ngược 30s
+    private var recordCountdownPill: some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(Color.red)
+                .frame(width: 9, height: 9)
+
+            Text("REC")
+                .font(.system(size: 13, weight: .bold))
+
+            if let seconds = cameraManager.recordCountdown {
+                Text(String(format: "%02d:%02d", seconds / 60, seconds % 60))
+                    .font(.system(size: 13, weight: .semibold))
+                    .monospacedDigit()
+
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(Color.white.opacity(0.25))
+                        Capsule()
+                            .fill(Color.red)
+                            .frame(width: geo.size.width * CGFloat(seconds) / CGFloat(CameraManager.maxRecordSeconds))
+                    }
+                }
+                .frame(width: 56, height: 5)
+            }
+        }
+        .foregroundColor(.white)
+        .padding(.vertical, 8)
+        .padding(.horizontal, 14)
+        .background(Capsule().fill(Color.black.opacity(0.55)))
     }
 
     private var permissionView: some View {
@@ -497,11 +854,14 @@ struct CameraScreen: View {
     // e.g. subject not fully in frame).
     private var bodyPointsBadge: some View {
         let count = cameraManager.detectedJointCount
+        let hasSubject = cameraManager.hasLiveSubject
         return HStack(spacing: 6) {
             Circle()
-                .fill(count > 0 ? Color.green : Color.gray)
+                .fill(hasSubject ? Color.green : (count > 0 ? Color.yellow : Color.gray))
                 .frame(width: 7, height: 7)
-            Text(count > 0 ? "\(count) điểm cơ thể" : "Chưa nhận diện được người")
+            Text(hasSubject ? "\(count) điểm cơ thể"
+                            : count > 0 ? "Tín hiệu yếu — đưa người vào khung rõ hơn"
+                                        : "Chưa nhận diện được người")
                 .font(.system(size: 12, weight: .medium))
         }
         .foregroundColor(.white)
@@ -510,16 +870,48 @@ struct CameraScreen: View {
         .background(Capsule().fill(Color.black.opacity(0.5)))
     }
 
-    private var extractingBanner: some View {
-        HStack(spacing: 8) {
-            ProgressView().tint(.white)
-            Text("Đang trích xuất khung hình từ video…")
-                .font(.system(size: 12, weight: .medium))
+    // MARK: - Checklist 6 tiêu chí (gợi ý liên tục từng mục)
+
+    @ViewBuilder
+    private func statusIcon(_ state: CriterionStatus.State) -> some View {
+        switch state {
+        case .ok:
+            Image(systemName: "checkmark.circle.fill").foregroundColor(.green)
+        case .violated:
+            Image(systemName: "exclamationmark.circle.fill").foregroundColor(.yellow)
+        case .waiting:
+            Image(systemName: "clock.fill").foregroundColor(.white.opacity(0.55))
+        case .unknown:
+            Image(systemName: "questionmark.circle").foregroundColor(.white.opacity(0.45))
+        }
+    }
+
+    private var criteriaChecklist: some View {
+        let statuses = cameraManager.guidanceResult?.statuses ?? []
+        return VStack(alignment: .leading, spacing: 5) {
+            ForEach(statuses) { s in
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    statusIcon(s.state)
+                        .font(.system(size: 11))
+                    Text(s.criterion.title)
+                        .font(.system(size: 12, weight: .semibold))
+                    Text(s.suggestion ?? (s.state == .waiting ? "chờ hướng mẫu đúng" : "đang đo…"))
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(s.suggestion != nil ? .yellow : .white.opacity(0.75))
+                        .lineLimit(2)
+                }
+            }
+            if statuses.isEmpty {
+                Text("Đang phân tích mẫu…")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(.white.opacity(0.75))
+            }
         }
         .foregroundColor(.white)
         .padding(.vertical, 8)
-        .padding(.horizontal, 14)
-        .background(Capsule().fill(Color.black.opacity(0.55)))
+        .padding(.horizontal, 10)
+        .frame(width: 250, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 14).fill(Color.black.opacity(0.45)))
     }
 
     // MARK: - Live guidance cue
@@ -537,11 +929,19 @@ struct CameraScreen: View {
                 .padding(.vertical, 12)
                 .padding(.horizontal, 24)
                 .background(Capsule().fill(Color.blue))
-            } else if let result = cameraManager.guidanceResult, let primary = result.primaryCue {
+            } else if cameraManager.isTemplateMissing {
+                Label("Không thấy người trong ảnh mẫu — chọn ảnh khác", systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(.white)
+                    .padding(.vertical, 10)
+                    .padding(.horizontal, 16)
+                    .background(Capsule().fill(Color.orange))
+            } else if let primary = cameraManager.stableCue ?? cameraManager.guidanceResult?.primaryCue {
                 VStack(spacing: 4) {
                     Text(primary)
                         .font(.system(size: 15, weight: .semibold))
-                    if let secondary = result.secondaryCue {
+                    // Cue phụ lấy từ danh sách vi phạm gốc, chỉ hiện khi khác cue chính.
+                    if let secondary = cameraManager.guidanceResult?.secondaryCue, secondary != primary {
                         Text(secondary)
                             .font(.system(size: 12, weight: .medium))
                             .foregroundColor(.black.opacity(0.45))
@@ -593,12 +993,28 @@ struct CameraScreen: View {
         }
     }
 
-    // Finish the session: pick the 5 frames (live burst + taps + video frames) that
-    // matched the reference pose best, and hand them to ResultScreen.
+    // Finish the session: a recorded clip goes through the Processing screen (frame
+    // extraction + quality scoring → top 5); photo-only sessions go straight to results
+    // with the best matches from the live-scored pool.
     private var doneButton: some View {
         Button {
-            if cameraManager.isRecording { cameraManager.stopRecording() }
-            showResult = true
+            if cameraManager.isRecording {
+                cameraManager.stopRecording()
+            } else if let videoURL = cameraManager.lastVideoURL {
+                onNavigate(.processing(videoURL: videoURL,
+                                       referenceImage: currentReferenceImage))
+            } else {
+                onNavigate(.result(
+                    videoURL: nil,
+                    frames: cameraManager.topScoredMatches(5).map { capture in
+                        AnalyzedFrame(image: capture.image,
+                                      time: 0,
+                                      poseScore: capture.score,
+                                      quality: ImageQualityAnalyzer.analyze(image: capture.image))
+                    },
+                    referenceImage: currentReferenceImage
+                ))
+            }
         } label: {
             Image(systemName: "checkmark.circle.fill")
                 .font(.system(size: 26))
@@ -696,11 +1112,11 @@ struct CameraScreen: View {
                 } else {
                     cameraManager.capturePhoto { image in
                         guard let image else { return }
+                        LocalCacheManager.shared.saveImage(image)
                         DispatchQueue.main.async {
                             cameraManager.lastCapturedImage = image
                             cameraManager.capturedItems.append(image)
                         }
-                        UIImageWriteToSavedPhotosAlbum(image, nil, nil, nil)
                     }
                 }
             } label: {
@@ -723,6 +1139,28 @@ struct CameraScreen: View {
 
             VStack(spacing: 10) {
                 Button {
+                    cameraManager.isPortraitMode.toggle()
+                } label: {
+                    Image(systemName: cameraManager.isPortraitMode ? "person.crop.square" : "person.crop.rectangle")
+                        .font(.system(size: 20, weight: .medium))
+                        .foregroundColor(.white)
+                        .frame(width: 48, height: 48)
+                        .background(Circle().fill(Color.white.opacity(cameraManager.isPortraitMode ? 0.3 : 0.15)))
+                }
+                .accessibilityLabel("Chế độ chân dung")
+
+                Button {
+                    showPoseGuide.toggle()
+                } label: {
+                    Image(systemName: showPoseGuide ? "person.fill.viewfinder" : "person.crop.artframe")
+                        .font(.system(size: 20, weight: .medium))
+                        .foregroundColor(.white)
+                        .frame(width: 48, height: 48)
+                        .background(Circle().fill(Color.white.opacity(showPoseGuide ? 0.3 : 0.15)))
+                }
+                .accessibilityLabel("Bật/tắt khung mẫu")
+
+                Button {
                     cameraManager.flipCamera()
                 } label: {
                     Image(systemName: "arrow.triangle.2.circlepath.camera")
@@ -743,6 +1181,78 @@ struct CameraScreen: View {
                 }
             }
         }
+    }
+}
+
+// MARK: - Portrait grid
+
+/// Khung vuông chế độ chân dung: làm tối phần NGOÀI khung, viền góc trắng,
+/// nhãn "CHÂN DUNG". `square` là toạ độ chuẩn hoá trên toàn màn hình — cùng hệ
+/// với `CameraManager.portraitCropNormalized` nên ảnh cắt ra khớp khung user thấy.
+struct PortraitFrameOverlayView: View {
+    let square: CGRect
+
+    var body: some View {
+        GeometryReader { geo in
+            let rect = CGRect(x: square.minX * geo.size.width,
+                              y: square.minY * geo.size.height,
+                              width: square.width * geo.size.width,
+                              height: square.height * geo.size.height)
+
+            ZStack {
+                // Làm tối ngoài khung: 4 dải phủ quanh hình vuông
+                Path { path in
+                    path.addRect(CGRect(x: 0, y: 0, width: geo.size.width, height: rect.minY))
+                    path.addRect(CGRect(x: 0, y: rect.maxY,
+                                        width: geo.size.width,
+                                        height: geo.size.height - rect.maxY))
+                    path.addRect(CGRect(x: 0, y: rect.minY, width: rect.minX, height: rect.height))
+                    path.addRect(CGRect(x: rect.maxX, y: rect.minY,
+                                        width: geo.size.width - rect.maxX,
+                                        height: rect.height))
+                }
+                .fill(Color.black.opacity(0.55))
+
+                // Góc bracket
+                CornerBracketsShape()
+                    .stroke(Color.white, style: StrokeStyle(lineWidth: 3.5, lineCap: .round))
+                    .frame(width: rect.width, height: rect.height)
+                    .position(x: rect.midX, y: rect.midY)
+
+                Text("CHÂN DUNG")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 4)
+                    .background(Capsule().fill(Color.black.opacity(0.6)))
+                    .position(x: rect.midX, y: rect.minY + 14)
+            }
+        }
+        .allowsHitTesting(false)
+    }
+}
+
+private struct CornerBracketsShape: Shape {
+    func path(in rect: CGRect) -> Path {
+        var p = Path()
+        let len: CGFloat = min(rect.width, rect.height) * 0.12
+        // Trên-trái
+        p.move(to: CGPoint(x: rect.minX, y: rect.minY + len))
+        p.addLine(to: CGPoint(x: rect.minX, y: rect.minY))
+        p.addLine(to: CGPoint(x: rect.minX + len, y: rect.minY))
+        // Trên-phải
+        p.move(to: CGPoint(x: rect.maxX - len, y: rect.minY))
+        p.addLine(to: CGPoint(x: rect.maxX, y: rect.minY))
+        p.addLine(to: CGPoint(x: rect.maxX, y: rect.minY + len))
+        // Dưới-phải
+        p.move(to: CGPoint(x: rect.maxX, y: rect.maxY - len))
+        p.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY))
+        p.addLine(to: CGPoint(x: rect.maxX - len, y: rect.maxY))
+        // Dưới-trái
+        p.move(to: CGPoint(x: rect.minX + len, y: rect.maxY))
+        p.addLine(to: CGPoint(x: rect.minX, y: rect.maxY))
+        p.addLine(to: CGPoint(x: rect.minX, y: rect.maxY - len))
+        return p
     }
 }
 
@@ -785,5 +1295,5 @@ struct PreviewGridView: View {
 }
 
 #Preview {
-    CameraScreen()
+    CameraScreen(onNavigate: { _ in }, onFinish: {})
 }
