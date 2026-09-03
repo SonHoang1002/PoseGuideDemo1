@@ -1,202 +1,183 @@
 //
-//  GuidanceEngine.swift  — v2
-//  Thuật toán kiểm 6 tiêu chí và sinh cue hướng dẫn realtime
+//  GuidanceEngine.swift  — v3 (phân lớp khung hình)
+//  Thuật toán kiểm 6 tiêu chí và sinh cue hướng dẫn realtime.
 //
-//  Đầu vào : CVPixelBuffer (1 frame) + CMDeviceMotion + thông số ống kính + Template
-//  Đầu ra  : GuidanceResult — danh sách vi phạm theo thứ tự 1→6, cue chính + cue phụ,
-//            và cờ readyToCapture (cổng cho phép bắt đầu ghi)
+//  Nguồn thiết kế:
+//    - GuidanceEngineV2.txt / NGUONG_VA_GOC_QUY_CHIEU.md — 7 nguyên nhân cue rung
+//      (bucket, attitude.pitch, giả định chiều cao, acos gần chính diện, thiếu
+//      debounce, không làm tròn số, không có sàn hành động) + cảnh báo
+//      visionOrientation. TẤT CẢ giữ nguyên ở bản này.
+//    - PoseCoach_Phan_Lop_Khung_Hinh_V3.docx ("verify tài liệu v2") — phát hiện
+//      NGUYÊN NHÂN THỨ 8, nguyên nhân duy nhất khiến cue KHÔNG BAO GIỜ tắt được:
+//      các bản trước tự chọn "mốc tốt nhất còn đo được" trên frame live, trong
+//      khi ảnh mẫu lại dùng mốc khác. Sửa bằng FramingClass.swift — mốc đo suy
+//      MỘT LẦN từ ảnh mẫu, áp nguyên xi cho mọi frame sau. Đồng thời: mục 3 đổi
+//      từ "đơn vị chiều cao mẫu" sang GÓC NHÌN (độ) — universal mọi lớp, không
+//      cần biết chiều cao thật; mục 1 dùng face yaw khi hông khuất (chân dung);
+//      ngưỡng & sàn hành động tách riêng theo từng lớp.
 //
-//  Công nghệ: Vision (VNDetectHumanBodyPoseRequest, VNDetectFaceRectanglesRequest)
-//             CoreMotion (dùng VECTOR TRỌNG LỰC, không dùng attitude.pitch)
-//  Không train model, không gọi server.
+//  ⚠️ CHƯA ĐO TRÊN MÁY THẬT (xem mục 9 tài liệu verify-v3). Các con số actionFloor
+//  không được tài liệu cho trực tiếp (mục 1,3,4,5,6) được suy từ đúng tỉ lệ
+//  accept:actionFloor mà v2 đã dùng — coi là giá trị khởi điểm, PHẢI đo lại độ
+//  lệch chuẩn thật cho cả 5 lớp trước khi chốt số (accept ≥ 3× độ lệch chuẩn).
+//  Chiều dấu của cue mục 3 (nâng/hạ) được suy từ hình học, cũng CẦN kiểm trên
+//  máy thật — nếu cue chỉ sai chiều, xem ghi chú tại `CueFactory.cameraElevation`.
 //
-//  ---------------------------------------------------------------------------
-//  KHÁC v1 (tóm tắt, chi tiết xem NGUONG_VA_GOC_QUY_CHIEU.md):
-//   1. Mọi ngưỡng gom vào GuidanceConfig — 1 chỗ duy nhất, có đơn vị, có preset.
-//   2. Mỗi mục có 4 số: accept / enterFactor / unlockFactor / actionFloor.
-//      -> có vùng chết (dead-band) + trễ (hysteresis) + "hành động quá nhỏ thì im".
-//   3. Mục 2 & 3 so SỐ LIÊN TỤC với template, không so bucket. Bucket chỉ để chọn CHỮ.
-//   4. Mục 3 đo theo ĐƠN VỊ CHIỀU CAO MẪU, triệt tiêu sai số "giả định cao 1m70".
-//   5. Pitch lấy từ vector trọng lực (gốc = mặt phẳng ngang), có lọc riêng.
-//   6. Debounce thời gian: vi phạm phải kéo dài mới hiện cue; cue có thời gian
-//      hiển thị tối thiểu; số trong cue được làm tròn và chỉ cập nhật 1 lần/giây.
-//   7. Cổng chụp tách riêng khỏi ngưỡng nhắc, có chống kẹt (stall timeout).
-//  ---------------------------------------------------------------------------
 
 import Vision
 import CoreMotion
 import AVFoundation
 import QuartzCore
+import ImageIO
 import simd
 
 // =====================================================================
-// MARK: - 0. CẤU HÌNH NGƯỠNG  ***SỬA MỌI THỨ Ở ĐÂY***
+// MARK: - 0. NGƯỠNG THEO TỪNG LỚP  ***SỬA MỌI THỨ Ở ĐÂY***
 // =====================================================================
 
-/// Một dải ngưỡng cho 1 tiêu chí. Đơn vị của `accept` và `actionFloor`
-/// là đơn vị riêng của tiêu chí đó (độ / % / phần khung / đơn-vị-chiều-cao-mẫu).
-///
-///   |err| <= accept                  -> ĐẠT. Im lặng. Được tính vào cổng chụp.
-///   accept < |err| <= accept*enter   -> VÙNG XÁM. Giữ nguyên trạng thái trước đó.
-///                                       Đang đạt thì vẫn coi là đạt (khỏi nhấp nháy),
-///                                       đang nhắc thì vẫn nhắc (để user chỉnh nốt).
-///   |err| > accept*enter             -> VI PHẠM, hiện cue.
-///   |err| > accept*unlock            -> MỞ KHÓA: được phép quay lại mục này
-///                                       kể cả khi đang làm mục dưới.
-///   action < actionFloor             -> IM LẶNG dù err vượt ngưỡng: lượng phải
-///                                       sửa quá nhỏ, người thật không làm nổi.
-nonisolated struct ThresholdBand {
+/// Một dải ngưỡng cho 1 tiêu chí. |err| <= accept → ĐẠT (im lặng).
+/// accept < |err| <= accept×enterFactor → vùng xám (giữ nguyên trạng thái).
+/// |err| > accept×enterFactor → VI PHẠM. |err| > accept×unlockFactor → mở khoá
+/// mục đã đạt. action < actionFloor → im lặng dù |err| vượt ngưỡng (lượng phải
+/// sửa quá nhỏ, người thật không làm nổi).
+struct ThresholdBand {
     var accept: Double
     var enterFactor: Double = 1.5
     var unlockFactor: Double = 3.0
     var actionFloor: Double = 0
 
-    var enter: Double  { accept * enterFactor }
+    var enter: Double { accept * enterFactor }
     var unlock: Double { accept * unlockFactor }
 }
 
-nonisolated struct GuidanceConfig {
+/// Ngưỡng cho cả 6 tiêu chí, riêng cho MỘT lớp khung hình.
+struct ClassThresholds {
+    var bodyYaw: ThresholdBand
+    var distance: ThresholdBand      // accept = tỉ lệ (vd 0.10 = 10%); actionFloor = MÉT
+    var elevation: ThresholdBand     // độ — góc nhìn máy tới mốc của lớp (mục 3)
+    var pitch: ThresholdBand         // độ — góc trục ống kính (mục 4)
+    var horizontal: ThresholdBand    // phần bề ngang khung
+    var spineTilt: ThresholdBand
+    var jointAngle: ThresholdBand
+    var headYaw: ThresholdBand
+}
 
-    // -----------------------------------------------------------------
-    // MỤC 1 — HƯỚNG MẪU (body yaw)
-    // Góc xoay thân quanh trục đứng, suy từ tỉ lệ (vai biểu kiến / chiều cao thân).
-    // Gốc quy chiếu: 0° = mẫu quay thẳng mặt vào máy; ±180° = quay lưng.
-    // Điểm gốc hình học = trung điểm hai vai.
-    // -----------------------------------------------------------------
-    var bodyYaw = ThresholdBand(accept: 30, enterFactor: 1.4, unlockFactor: 2.5, actionFloor: 15)
+struct GuidanceConfig {
 
-    /// Vùng chết chính diện: khi r/rFront >= số này thì coi yaw = 0.
-    /// Lý do: yaw = acos(r/rFront), gần chính diện đạo hàm của acos → vô cực,
-    /// nhiễu 2% ở r biến thành 12° ở yaw. Đây là 1 trong các nguồn nháy cue của v1.
+    /// Vùng chết chính diện: r/rFront >= số này thì coi bodyYaw = 0. acos gần 0°
+    /// có đạo hàm → vô cực, nhiễu 2% ở r biến thành 12° ở yaw.
     var bodyYawFrontalDeadZone: Double = 0.93
-
-    /// Chiều cao thân tối thiểu (phần khung) mới tin được số đo yaw.
+    /// Chiều cao thân tối thiểu (phần khung) mới tin công thức vai/thân.
     var bodyYawMinTorsoHeight: Double = 0.08
+    /// Hiệu chuẩn mặc định khi mẫu chính diện (median thật cần đo với ≥5 người,
+    /// gồm người mặc áo rộng — xem mục 9 tài liệu verify-v3).
+    var rFrontDefault: Double = 0.62
 
-    /// Hệ số hiệu chuẩn r_front khi chưa đo được trên người thật
-    /// (bề ngang vai biểu kiến / chiều cao thân của người chính diện).
-    var defaultRFront: Double = 0.62
-
-    // -----------------------------------------------------------------
-    // MỤC 2 — XA/GẦN
-    // err = (ratio_live / ratio_template) − 1, cùng mốc HeightAnchor.
-    // actionFloor tính bằng MÉT.
-    // -----------------------------------------------------------------
-    var distance = ThresholdBand(accept: 0.10, enterFactor: 1.5, unlockFactor: 3.0, actionFloor: 0.35)
+    /// FOV dọc tham chiếu dùng để ước lượng elevationDeg của ẢNH MẪU tĩnh —
+    /// không có IMU tại thời điểm chụp mẫu nên không biết FOV thật của máy đã
+    /// chụp ảnh đó. Live dùng CameraOptics.vFovDeg đo thật, chính xác hơn.
+    var referenceVFOVDegrees: Double = 62.0
 
     // -----------------------------------------------------------------
-    // MỤC 3 — MÁY CAO/THẤP
-    // rel = (cao độ máy − đỉnh đầu mẫu) / chiều cao mẫu. Gốc = đỉnh đầu (0.0).
-    // Âm = máy thấp hơn đỉnh đầu. Công thức KHÔNG phụ thuộc chiều cao thật của mẫu.
+    // CHẤT LƯỢNG SỐ ĐO — dưới ngưỡng này thì KHÔNG ĐO ĐƯỢC (loại mục ra),
+    // KHÔNG phải "sai".
     // -----------------------------------------------------------------
-    var cameraHeight = ThresholdBand(accept: 0.07, enterFactor: 1.5, unlockFactor: 3.0, actionFloor: 0.045)
+    var minKeypointConfidenceCore: Float = 0.50   // vai, hông
+    var minKeypointConfidenceLimb: Float = 0.40   // khuỷu, cổ tay, gối, cổ chân
+    var minValidFramesBeforeUse: Int = 3
+    var faceCacheSeconds: Double = 0.6
 
     // -----------------------------------------------------------------
-    // MỤC 4 — NGỬA/CHÚC
-    // Góc ngẩng của TRỤC QUANG so với mặt phẳng ngang, lấy từ vector trọng lực.
-    // Dương = ngửa lên trời, âm = chúc xuống đất.
+    // THỜI GIAN — chống nháy cue (dùng chung cho mọi lớp, v2 không nói cần
+    // tách theo lớp cho phần này)
     // -----------------------------------------------------------------
-    var cameraPitch = ThresholdBand(accept: 5.0, enterFactor: 1.5, unlockFactor: 3.0, actionFloor: 4.0)
+    var cueEnterHoldSeconds: Double = 0.45
+    var cueExitHoldSeconds: Double = 0.20
+    var cueMinDisplaySeconds: Double = 1.20
+    var cueNumberRefreshSeconds: Double = 1.00
 
-    // -----------------------------------------------------------------
-    // MỤC 5 — LỆCH TRÁI/PHẢI: hiệu X tâm thân live − template (phần bề ngang khung).
-    // Tâm thân = trung điểm của (trung điểm hai vai, trung điểm hai hông).
-    // -----------------------------------------------------------------
-    var horizontal = ThresholdBand(accept: 0.05, enterFactor: 1.5, unlockFactor: 3.0, actionFloor: 0.02)
-
-    /// Lệch quá mức này thì bảo BƯỚC ngang, dưới mức này thì bảo XOAY máy quanh trục Oy.
-    var panVsStepThreshold: Double = 0.15
-
-    // -----------------------------------------------------------------
-    // MỤC 6 — DÁNG: góc tại từng khớp (đỉnh góc = chính khớp đó); trục thân;
-    // hướng đầu. Gốc quy chiếu là TEMPLATE ở từng góc/khớp tương ứng.
-    // -----------------------------------------------------------------
-    var jointAngle = ThresholdBand(accept: 15, enterFactor: 1.5, unlockFactor: 3.0, actionFloor: 12)
-    var spineTilt  = ThresholdBand(accept: 10, enterFactor: 1.5, unlockFactor: 3.0, actionFloor: 8)
-    var headYaw    = ThresholdBand(accept: 25, enterFactor: 1.4, unlockFactor: 3.0, actionFloor: 15)
-
-    // -----------------------------------------------------------------
-    // CHẤT LƯỢNG SỐ ĐO — dưới ngưỡng này coi là KHÔNG ĐO ĐƯỢC (bỏ qua mục),
-    // KHÔNG phải là "sai". Nguyên tắc PRD: mục không đo được thì loại ra.
-    // -----------------------------------------------------------------
-    var minKeypointConfidenceCore: Float = 0.50    // vai, hông — dùng cho mục 1,2,3,5
-    var minKeypointConfidenceLimb: Float = 0.40    // khuỷu, cổ tay, gối, cổ chân — mục 6
-    /// Bậc mềm CHÓT cho vai/hông: dưới mức này mới kết luận "không có người".
-    /// Skeleton hiển thị từ 0.10 nên bản cũ hay bị nghịch lý "vẫn thấy chấm xanh
-    /// mà app báo không tìm thấy người" — ngưỡng đo và ngưỡng vẽ lệch nhau quá xa.
-    var minKeypointConfidenceTorsoFloor: Float = 0.25
-    var minKeypointConfidenceDisplay: Float = 0.10 // chỉ để vẽ skeleton, không tính toán
-    var minValidFramesBeforeUse: Int = 3           // cần N frame liên tiếp đo được mới dùng
-    var faceCacheSeconds: Double = 0.6             // face chạy thưa, dùng lại kết quả cũ
-
-    // -----------------------------------------------------------------
-    // THỜI GIAN — chống nháy cue (nguyên nhân số 1 của "cue chạy liên tục")
-    // -----------------------------------------------------------------
-    var cueEnterHoldSeconds: Double = 0.45        // vi phạm phải kéo dài mới hiện cue
-    var cueExitHoldSeconds: Double = 0.20         // đạt phải giữ lâu mới tắt cue
-    var cueMinDisplaySeconds: Double = 1.20       // cue đã hiện phải ở lại tối thiểu
-    var cueNumberRefreshSeconds: Double = 1.00    // con số chỉ cập nhật mỗi giây một lần
-
-    // -----------------------------------------------------------------
-    // LÀM TRÒN CON SỐ TRONG CUE — số nhảy từng đơn vị làm user tưởng app loạn
-    // -----------------------------------------------------------------
     var quantizeDegrees: Double = 5
     var quantizeCentimeters: Double = 5
 
     // -----------------------------------------------------------------
     // CỔNG CHỤP
     // -----------------------------------------------------------------
-    var dwellSeconds: Double = 0.80           // đủ 6 mục → giữ ổn định ngần này
-    var countdownSeconds: Double = 3.00       // rồi đếm ngược (GHI NGAY TỪ LÚC BẮT ĐẾM)
-    var countdownGraceSeconds: Double = 1.00  // lệch giữa chừng: chờ ngần này mới huỷ
-    /// Đang lắc máy mạnh hơn mức này thì không cho vào dwell (tránh chụp lúc tay đang đưa).
+    var dwellSeconds: Double = 0.80
+    var countdownSeconds: Double = 3.00
+    var countdownGraceSeconds: Double = 1.00
     var maxAngularSpeedDegPerSec: Double = 15
-    /// Lắc mạnh hơn mức này thì ĐÓNG BĂNG cue đang hiện (user đang di chuyển theo hướng dẫn).
     var freezeCueAngularSpeedDegPerSec: Double = 45
-    /// Chống kẹt: mục đã khóa trôi vào vùng xám quá lâu → mở khóa, nhắc lại.
     var stallTimeoutSeconds: Double = 2.50
 
     // -----------------------------------------------------------------
-    // NHỊP XỬ LÝ
+    // NHỊP XỬ LÝ (mốc iPhone 11)
     // -----------------------------------------------------------------
-    var poseEveryNFrames: Int = 1   // demo: pose chạy mỗi frame để skeleton mượt
-    var faceEveryNFrames: Int = 3
-    var assumedBodyHeightMeters: Double = 1.70  // CHỈ để đổi ra "bước"/"cm" trong câu chữ
+    var poseEveryNFrames: Int = 2
+    var faceEveryNFrames: Int = 8
+    /// CHỈ để đổi % → "bước" trong câu chữ mục 2. Không dùng để so ngưỡng.
+    var assumedBodyHeightMeters: Double = 1.70
 
-    /// ***PHẢI KIỂM TRÊN MÁY THẬT.*** Buffer từ AVCapture là LANDSCAPE theo cảm biến.
-    /// Cầm dọc + camera sau ⇒ `.right`. Truyền `.up` như v1 sẽ làm trục X/Y của Vision
-    /// bị hoán đổi so với khung hình user nhìn thấy — mục 3 và 5 sai hệ thống.
+    /// ***PHẢI KIỂM TRÊN MÁY THẬT.*** Buffer AVCapture là LANDSCAPE theo cảm
+    /// biến; cầm dọc + camera sau ⇒ `.right`. Đây chỉ là giá trị THAM KHẢO cho
+    /// test — nơi gọi (CameraManager) vẫn tự tính theo camera trước/sau vì
+    /// hướng cầm máy đổi liên tục, không cố định như tài liệu gốc giả định.
     var visionOrientation: CGImagePropertyOrientation = .right
 
     // -----------------------------------------------------------------
-    // PRESET
+    // NGƯỠNG THEO LỚP — bảng lõi từ PoseCoach_Phan_Lop_Khung_Hinh_V3.docx §5.
+    // actionFloor không được tài liệu cho trực tiếp (trừ mục 2) được suy từ
+    // đúng tỉ lệ accept:actionFloor mà v2 đã dùng cho lớp toàn thân.
     // -----------------------------------------------------------------
-    static let `default` = GuidanceConfig()
+    var perClass: [FramingClass: ClassThresholds] = GuidanceConfig.defaultClassThresholds()
 
-    /// Khắt khe hơn — dùng khi test độ chính xác, không dùng cho user thật.
-    static var strict: GuidanceConfig {
-        var c = GuidanceConfig()
-        c.bodyYaw.accept = 20
-        c.distance.accept = 0.06
-        c.cameraHeight.accept = 0.045
-        c.cameraPitch.accept = 3
-        c.horizontal.accept = 0.03
-        c.jointAngle.accept = 10
-        return c
+    func thresholds(for cls: FramingClass) -> ClassThresholds {
+        perClass[cls] ?? GuidanceConfig.defaultClassThresholds()[.full]!
     }
 
-    /// Dễ tính — cho template dễ, hoặc khi người cầm máy đã hết kiên nhẫn.
-    /// PRD: live chỉ cần đúng 80%, sai số được "rửa" ở khâu chọn khung + tự cắt.
-    static var relaxed: GuidanceConfig {
-        var c = GuidanceConfig()
-        c.bodyYaw.accept = 40
-        c.distance.accept = 0.15
-        c.cameraHeight.accept = 0.10
-        c.cameraPitch.accept = 8
-        c.horizontal.accept = 0.08
-        c.jointAngle.accept = 22
-        c.cueEnterHoldSeconds = 0.6
-        return c
+    static let `default` = GuidanceConfig()
+
+    static func defaultClassThresholds() -> [FramingClass: ClassThresholds] {
+        let fullKnee = ClassThresholds(
+            bodyYaw:    ThresholdBand(accept: 30, enterFactor: 1.4, unlockFactor: 2.5, actionFloor: 15),
+            distance:   ThresholdBand(accept: 0.10, actionFloor: 0.35),
+            elevation:  ThresholdBand(accept: 6, actionFloor: 4),
+            pitch:      ThresholdBand(accept: 5, actionFloor: 4),
+            horizontal: ThresholdBand(accept: 0.05, actionFloor: 0.02),
+            spineTilt:  ThresholdBand(accept: 10, actionFloor: 8),
+            jointAngle: ThresholdBand(accept: 15, actionFloor: 12),
+            headYaw:    ThresholdBand(accept: 25, enterFactor: 1.4, actionFloor: 15)
+        )
+        let half = ClassThresholds(
+            bodyYaw:    ThresholdBand(accept: 30, enterFactor: 1.4, unlockFactor: 2.5, actionFloor: 15),
+            distance:   ThresholdBand(accept: 0.10, actionFloor: 0.30),
+            elevation:  ThresholdBand(accept: 6, actionFloor: 4),
+            pitch:      ThresholdBand(accept: 5, actionFloor: 4),
+            horizontal: ThresholdBand(accept: 0.05, actionFloor: 0.02),
+            spineTilt:  ThresholdBand(accept: 10, actionFloor: 8),
+            jointAngle: ThresholdBand(accept: 15, actionFloor: 12),
+            headYaw:    ThresholdBand(accept: 25, enterFactor: 1.4, actionFloor: 15)
+        )
+        let chest = ClassThresholds(
+            bodyYaw:    ThresholdBand(accept: 20, enterFactor: 1.4, unlockFactor: 2.5, actionFloor: 10),
+            distance:   ThresholdBand(accept: 0.08, actionFloor: 0.12),
+            elevation:  ThresholdBand(accept: 4, actionFloor: 2.7),
+            pitch:      ThresholdBand(accept: 4, actionFloor: 3.2),
+            horizontal: ThresholdBand(accept: 0.04, actionFloor: 0.016),
+            spineTilt:  ThresholdBand(accept: 12, actionFloor: 9.6),
+            jointAngle: ThresholdBand(accept: 18, actionFloor: 14.4),
+            headYaw:    ThresholdBand(accept: 15, enterFactor: 1.4, actionFloor: 9)
+        )
+        let head = ClassThresholds(
+            bodyYaw:    ThresholdBand(accept: 15, enterFactor: 1.4, unlockFactor: 2.5, actionFloor: 7.5),
+            distance:   ThresholdBand(accept: 0.06, actionFloor: 0.08),
+            elevation:  ThresholdBand(accept: 3, actionFloor: 2.0),
+            pitch:      ThresholdBand(accept: 3, actionFloor: 2.4),
+            horizontal: ThresholdBand(accept: 0.03, actionFloor: 0.012),
+            spineTilt:  ThresholdBand(accept: 12, actionFloor: 9.6),   // không dùng (head không có nhóm spine)
+            jointAngle: ThresholdBand(accept: 18, actionFloor: 14.4),  // không dùng (head không có nhóm arms/legs)
+            headYaw:    ThresholdBand(accept: 10, enterFactor: 1.4, actionFloor: 6)
+        )
+        return [.full: fullKnee, .knee: fullKnee, .half: half, .chest: chest, .head: head]
     }
 }
 
@@ -204,27 +185,26 @@ nonisolated struct GuidanceConfig {
 // MARK: - 1. KIỂU DỮ LIỆU
 // =====================================================================
 
-nonisolated enum LensKind { case ultraWide, wide }   // 0.5x / 1x
+enum LensKind { case ultraWide, wide }
 
-nonisolated enum Criterion: Int, CaseIterable {
-    case bodyYaw      = 1   // hướng mẫu          (mẫu làm)
-    case distance     = 2   // xa/gần             (người chụp làm)
-    case cameraHeight = 3   // máy cao/thấp       (người chụp làm)
-    case cameraPitch  = 4   // ngửa/chúc          (người chụp làm)
-    case horizontal   = 5   // lệch trái/phải     (người chụp làm)
-    case pose         = 6   // dáng               (mẫu làm)
+enum Criterion: Int, CaseIterable {
+    case bodyYaw      = 1
+    case distance     = 2
+    case elevation    = 3
+    case pitch        = 4
+    case horizontal   = 5
+    case pose         = 6
 
     var title: String {
         switch self {
-        case .bodyYaw:      return "Hướng mẫu"
-        case .distance:     return "Xa/gần"
-        case .cameraHeight: return "Máy cao/thấp"
-        case .cameraPitch:  return "Ngửa/chúc"
-        case .horizontal:   return "Trái/phải"
-        case .pose:         return "Dáng"
+        case .bodyYaw:    return "Hướng mẫu"
+        case .distance:   return "Xa/gần"
+        case .elevation:  return "Máy cao/thấp"
+        case .pitch:      return "Ngửa/chúc"
+        case .horizontal: return "Trái/phải"
+        case .pose:       return "Dáng"
         }
     }
-
     var actor: Violation.Actor {
         switch self {
         case .bodyYaw, .pose: return .model
@@ -233,172 +213,36 @@ nonisolated enum Criterion: Int, CaseIterable {
     }
 }
 
-nonisolated enum JointName: String, CaseIterable {
+enum JointName: String, CaseIterable {
     case leftElbow, rightElbow, leftShoulder, rightShoulder, leftKnee, rightKnee
 }
 
-/// Mốc đo chiều cao mẫu. Template và live PHẢI dùng cùng một mốc.
-/// factorOfFullHeight = phần chiều cao toàn thân mà mốc đó chiếm (nhân trắc).
-/// CHEST/HEAD dùng `faceHeight` (chiều cao khung mặt) — nhỏ, không quy đổi được
-/// toàn thân nên `factorOfFullHeight` = 0 (không dùng để suy chiều cao).
-nonisolated enum HeightAnchor: Int, Comparable, CaseIterable {
-    case faceHeight    = 0   // chân dung/bán thân — chiều cao khung mặt
-    case shoulderToHip = 1   // tệ nhất thân, dùng khi chỉ thấy nửa người
-    case headToHip     = 2
-    case headToKnee    = 3
-    case headToAnkle   = 4   // tốt nhất
-
-    var factorOfFullHeight: Double {
-        switch self {
-        case .faceHeight:    return 0
-        case .headToAnkle:   return 0.96
-        case .headToKnee:    return 0.715
-        case .headToHip:     return 0.47
-        case .shoulderToHip: return 0.29
-        }
-    }
-
-    /// Có thể quy đổi ra chiều cao toàn thân không.
-    var isFullHeightScalable: Bool { factorOfFullHeight > 0 }
-
-    static func < (a: HeightAnchor, b: HeightAnchor) -> Bool { a.rawValue < b.rawValue }
-}
-
-// ---------------------------------------------------------------------
-// LỚP KHUNG HÌNH — V3 (Phân lớp khung hình và tiêu chí theo từng lớp)
-// Suy MỘT LẦN từ ảnh mẫu rồi áp nguyên xi cho mọi frame live/video.
-// Quyết định toàn bộ cách đo + bộ phận được kiểm.
-// ---------------------------------------------------------------------
-
-/// Nhóm khớp được chấm ở mục "Dáng". Chân dung chỉ chấm các nhóm liên quan.
-nonisolated enum PoseGroup: String, CaseIterable {
-    case spine, head, arms, legs
-}
-
-/// Nguồn đo hướng mẫu (mục 1). CHEST/HEAD dùng face yaw vì hông khuất.
-nonisolated enum FramingYawSource: String {
-    case shoulderForeshortening
-    case faceYaw
-}
-
-/// Năm lớp khung hình theo tài liệu V3.
-nonisolated enum FramingClass: String, Codable, CaseIterable {
-    case full   // toàn thân — thấy cổ chân
-    case knee   // 3/4 người — cắt dưới gối
-    case half   // nửa người — cắt dưới hông
-    case chest  // bán thân — cắt trên hông
-    case head   // chân dung cận — chỉ đầu + vai
-
-    /// 2 MODE cao cấp đúng yêu cầu: FULL = toàn thân; còn lại = 1 phần cơ thể.
-    var captureMode: CaptureMode {
-        switch self {
-        case .full: return .full
-        case .knee, .half, .chest, .head: return .upper
-        }
-    }
-
-    /// Có cần thấy hông (đủ cả thân dưới) để đo các mốc "toàn thân" không.
-    var requiresHip: Bool {
-        switch self {
-        case .full, .knee, .half: return true
-        case .chest, .head: return false
-        }
-    }
-
-    /// Mốc tỉ lệ (mục 2) — DÙNG ĐÚNG MỐC của lớp, không "lấy mốc tốt nhất còn đo".
-    var scaleAnchor: HeightAnchor {
-        switch self {
-        case .full:  return .headToAnkle
-        case .knee:  return .headToKnee
-        case .half:  return .headToHip
-        case .chest, .head: return .faceHeight
-        }
-    }
-
-    /// Nguồn đo hướng mẫu (mục 1).
-    var yawSource: FramingYawSource {
-        switch self {
-        case .full, .knee, .half: return .shoulderForeshortening
-        case .chest, .head:       return .faceYaw
-        }
-    }
-
-    /// Các nhóm khớp được chấm ở mục Dáng — RẠCH RÒI: bỏ hẳn nhóm không liên quan.
-    var poseGroups: [PoseGroup] {
-        switch self {
-        case .full:  return [.spine, .head, .arms, .legs]
-        case .knee:  return [.spine, .head, .arms]
-        case .half:  return [.spine, .head, .arms]
-        case .chest: return [.head, .arms]
-        case .head:  return [.head]
-        }
-    }
-
-    /// Tên hiển thị tiếng Việt cho dialog/log.
-    var title: String {
-        switch self {
-        case .full:  return "Toàn thân"
-        case .knee:  return "¾ người"
-        case .half:  return "Nửa người"
-        case .chest: return "Bán thân"
-        case .head:  return "Chân dung"
-        }
-    }
-}
-
-/// Hai mode cấp cao: toàn thân (full) hay 1 phần cơ thể (upper).
-nonisolated enum CaptureMode: String, Codable, CaseIterable {
-    case full
-    case upper
-
-    var title: String {
-        switch self {
-        case .full:  return "Toàn thân"
-        case .upper: return "Một phần cơ thể (phần trên)"
-        }
-    }
-}
-
-/// Template đã phân tích sẵn offline (TemplateAnalyzer).
-nonisolated struct Template {
-    // V3 — lớp khung hình suy từ ảnh mẫu. Áp nguyên xi cho mọi frame live/video.
+/// Template đã phân tích sẵn từ ảnh mẫu (xem TemplateAnalyzer.swift). `framing`
+/// quyết định mốc đo — mọi frame live/video sau đó PHẢI dùng đúng mốc này.
+struct Template {
     let framing: FramingClass
-    /// 2 mode cấp cao (full / upper) — tiện cho UI + dialog.
-    let captureMode: CaptureMode
-    // Mục 1
-    let bodyYawDeg: Double                        // -180...180, 0 = chính diện
-    // Mục 2 — LƯU NHIỀU MỐC để live chọn được mốc trùng
-    let sizeRatioByAnchor: [HeightAnchor: Double] // chiều dài mốc / chiều cao khung
-    // Mục 3 — đơn vị chiều cao mẫu, gốc = đỉnh đầu
-    let cameraHeightRel: Double
-    // Mục 4 — độ, gốc = mặt phẳng ngang
-    let cameraPitchDeg: Double
-    // Mục 5 — 0...1 từ mép trái khung
-    let torsoCenterX: Double
-    // Ống kính bị khoá theo template
-    let lens: LensKind
-    // Mục 6
+
+    let bodyYawDeg: Double            // 0 = mẫu quay thẳng mặt vào máy, ±180 = quay lưng
+    let scaleValue: Double            // giá trị theo framing.scaleAnchor (0...1 phần khung)
+    let centerX: Double               // 0 = mép trái, 1 = mép phải (theo framing.centerAnchor)
+    let centerY: Double
+    let elevationDeg: Double          // góc nhìn máy tới framing.elevationAnchor (độ)
+    let cameraPitchDeg: Double        // ước lượng — ảnh mẫu tĩnh không có IMU, coi ~0
+
     let jointAngles: [JointName: Double]
     let spineTiltDeg: Double
-    let headYawDeg: Double?                       // nil nếu template quay lưng
-    /// Câu nhắc dáng soạn sẵn theo template
-    let cueForModel: String
-    /// Điểm khớp thô của ảnh mẫu (hệ Vision gốc dưới-trái, chuẩn hoá 0...1) —
-    /// dùng để vẽ khung mẫu (ghost) lên preview cho người chụp ướm người vào.
-    let ghostJoints: [VNHumanBodyPoseObservation.JointName: CGPoint]
-    /// Tỉ lệ w/h của ảnh mẫu — khung mẫu được letterbox đúng tỉ lệ này để
-    /// dáng người trong khong bị méo so với ảnh gốc.
-    let sampleAspectRatio: Double
+    let headYawDeg: Double?           // nil nếu không thấy mặt
 
-    var cameraHeightBucket: Int { Buckets.height(cameraHeightRel) }
-    var pitchBucket: Int        { Buckets.pitch(cameraPitchDeg) }
+    let lens: LensKind
+    /// Câu nhắc dáng soạn sẵn (giọng tự nhiên).
+    let cueForModel: String
 }
 
-/// Thông số quang học của camera đang dùng.
-nonisolated struct CameraOptics {
+/// Thông số quang học camera đang dùng.
+struct CameraOptics {
     let hFovDeg: Double
     let vFovDeg: Double
-    let focalPixels: Double        // tiêu cự quy ra pixel theo CHIỀU DỌC ảnh
+    let focalPixels: Double
     let imageWidthPixels: Double
     let imageHeightPixels: Double
 
@@ -411,8 +255,9 @@ nonisolated struct CameraOptics {
         self.imageHeightPixels = imageHeightPixels
     }
 
-    /// Ưu tiên tuyệt đối: lấy từ intrinsicMatrix của sample buffer (chính xác thật).
-    init(intrinsics: simd_float3x3, imageSize: CGSize) {
+    /// Chính xác nhất: từ intrinsicMatrix của sample buffer (cần bật
+    /// `connection.isCameraIntrinsicMatrixDeliveryEnabled = true`).
+    init(intrinsics: matrix_float3x3, imageSize: CGSize) {
         let fx = Double(intrinsics[0][0])
         let fy = Double(intrinsics[1][1])
         self.imageWidthPixels  = Double(imageSize.width)
@@ -422,162 +267,99 @@ nonisolated struct CameraOptics {
         self.hFovDeg = 2 * atan(Double(imageSize.width)  / 2 / fx).degrees
     }
 
-    /// Fallback khi không có intrinsics. videoFieldOfView là FOV theo cạnh DÀI cảm biến;
-    /// caller truyền imageSize ở dạng DỌC (height = cạnh dài) khi cầm máy dọc.
+    /// Fallback khi không có intrinsics. videoFieldOfView là FOV theo CHIỀU DÀI
+    /// cảm biến — cầm dọc thì đó là chiều DỌC ảnh.
     init(device: AVCaptureDevice, imageSize: CGSize) {
         let fovLong = Double(device.activeFormat.videoFieldOfView)
-        let vFov = fovLong > 0 ? fovLong : 75.0
         let shortSide = min(imageSize.width, imageSize.height)
         let longSide  = max(imageSize.width, imageSize.height)
-        let fovShort = 2 * atan(tan(vFov.radians / 2) * Double(shortSide / longSide)).degrees
-        self.vFovDeg = vFov
+        let fovShort = 2 * atan(tan(fovLong.radians / 2) * Double(shortSide / longSide)).degrees
+        self.vFovDeg = fovLong
         self.hFovDeg = fovShort
         self.imageWidthPixels  = Double(imageSize.width)
         self.imageHeightPixels = Double(imageSize.height)
-        self.focalPixels = (Double(imageSize.height) / 2) / tan(vFov.radians / 2)
+        self.focalPixels = (Double(imageSize.height) / 2) / tan(fovLong.radians / 2)
     }
 
-    /// Góc lệch (độ) của một điểm so với tâm khung, theo chiều DỌC. Dương = phía trên tâm.
-    /// Dùng mô hình pinhole đúng, không xấp xỉ tuyến tính theo FOV như v1.
+    /// Góc lệch (độ) của một điểm so với tâm khung, theo chiều DỌC.
+    /// Dương = điểm nằm phía TRÊN tâm khung (y < 0.5).
     func elevationOffsetDeg(normalizedY y: Double) -> Double {
         atan((0.5 - y) * imageHeightPixels / focalPixels).degrees
     }
-
     /// Tương tự theo chiều NGANG. Dương = phía phải tâm.
     func azimuthOffsetDeg(normalizedX x: Double) -> Double {
         atan((x - 0.5) * imageWidthPixels / focalPixels).degrees
     }
 }
 
-/// Một điểm khớp phục vụ hiển thị skeleton.
-nonisolated struct JointPoint {
-    let location: CGPoint   // Vision-native, origin bottom-left, normalized 0-1
-    let confidence: Float
-}
-
-/// Kết quả đo trên 1 frame. nil = KHÔNG ĐO ĐƯỢC (khác hẳn với "sai").
-nonisolated struct Measurement {
+/// Kết quả đo trên 1 frame. nil = KHÔNG ĐO ĐƯỢC (khác "sai").
+struct Measurement {
     var timestamp: Double = 0
     var hasSubject: Bool = false
 
-    /// Lớp khung hình áp cho frame này (do template quyết định, trước khi đo).
-    var framing: FramingClass = .full
-    var captureMode: CaptureMode { framing.captureMode }
-    var includesHip: Bool = false   // frame live có đo được hông không
-
     var bodyYawDeg: Double?
-    var bodyYawIsFrontalFlat: Bool = false   // đang trong vùng chết chính diện
+    var bodyYawIsFrontalFlat: Bool = false
 
-    var heightAnchor: HeightAnchor?
-    var sizeRatio: Double?                   // theo heightAnchor
-    var fullHeightPixels: Double?            // chiều cao toàn thân quy đổi, pixel
-    var distanceMeters: Double?              // ước lượng thô — CHỈ để đổi ra "bước"
-
-    var cameraHeightRel: Double?             // gốc = đỉnh đầu, đơn vị chiều cao mẫu
-    var cameraPitchDeg: Double = 0           // gốc = mặt phẳng ngang
-    var rollDeg: Double = 0                  // vẹo chân trời (chỉ để tự nắn ảnh)
+    var scaleValue: Double?
+    var centerX: Double?
+    var centerY: Double?
+    /// Góc nhìn (độ) từ máy tới mốc của lớp khung hình (mục 3). Xem
+    /// `CameraOptics.elevationOffsetDeg` + `cameraPitchDeg` — độc lập với mục 4.
+    var elevationDeg: Double?
+    var cameraPitchDeg: Double = 0     // gốc = mặt phẳng ngang, từ vector trọng lực
+    var rollDeg: Double = 0
     var angularSpeedDegPerSec: Double = 0
 
-    var torsoCenterX: Double?
     var jointAngles: [JointName: Double] = [:]
     var spineTiltDeg: Double?
     var headYawDeg: Double?
 
-    /// Toàn bộ keypoint thô (hệ gốc dưới-trái của Vision) — dùng để vẽ skeleton overlay.
+    /// Toàn bộ keypoint thô (gốc dưới-trái của Vision) — vẽ skeleton overlay.
     var jointPoints: [VNHumanBodyPoseObservation.JointName: JointPoint] = [:]
 }
 
-/// Một vi phạm tiêu chí.
-nonisolated struct Violation {
+/// A single detected body joint kept for display purposes.
+struct JointPoint {
+    let location: CGPoint
+    let confidence: Float
+}
+
+struct Violation {
     enum Actor { case model, shooter }
     let criterion: Criterion
     let actor: Actor
-    let error: Double            // sai số thô (đơn vị của mục)
-    let normalizedError: Double  // |error| / accept — 1.0 = đúng ngưỡng
-    let detail: String           // log/debug
-    let cue: String              // câu hiện lên màn hình
+    let error: Double
+    let normalizedError: Double
+    let detail: String
+    let cue: String
 }
 
-nonisolated struct GuidanceResult {
-    let violations: [Violation]          // đã sắp theo thứ tự 1→6
-    let passedCount: Int                 // số mục đã đạt (cho vòng tiến độ)
-    let readyToCapture: Bool             // TẤT CẢ mục đạt → cổng chụp mở
+struct GuidanceResult {
+    let violations: [Violation]
+    let passedCount: Int
+    let readyToCapture: Bool
     let worstNormalizedError: Double
     let debug: [Criterion: String]
-    /// Trạng thái RIÊNG của từng tiêu chí 1→6 — cho bảng checklist hiển thị
-    /// gợi ý liên tục theo từng mục (không chỉ mục ưu tiên cao nhất).
-    let statuses: [CriterionStatus]
 
     var primaryCue: String?   { violations.first?.cue }
     var secondaryCue: String? { violations.count > 1 ? violations[1].cue : nil }
     var isAligned: Bool { violations.isEmpty }
 }
 
-/// Một dòng trong bảng checklist 6 tiêu chí.
-nonisolated struct CriterionStatus: Identifiable {
-    enum State {
-        case ok         // đạt
-        case violated   // sai — `suggestion` là câu gợi ý riêng của mục này
-        case waiting    // tạm vô nghĩa vì mục phía trên chưa đúng (vd trái/phải khi mẫu quay lưng)
-        case unknown    // không đo được frame này
-    }
-    var id: Int { criterion.rawValue }
-    let criterion: Criterion
-    let state: State
-    let suggestion: String?
-}
-
 // =====================================================================
-// MARK: - 2. PHÂN MỨC (chỉ dùng để CHỌN CHỮ, không dùng để so sánh)
+// MARK: - 2. LỌC NHIỄU
 // =====================================================================
 
-nonisolated enum Buckets {
-    /// rel = (cao độ máy − đỉnh đầu) / chiều cao mẫu.
-    /// Mốc giải phẫu: mắt ≈ −0.06 · vai ≈ −0.18 · hông ≈ −0.47 · gối ≈ −0.72 · đất = −1.0
-    static func height(_ rel: Double) -> Int {
-        if rel >  0.25 { return 4 }   // rất cao, giơ quá đầu
-        if rel >  0.02 { return 3 }   // cao, ngang đỉnh đầu
-        if rel > -0.27 { return 2 }   // ngang mắt / ngang mặt
-        if rel > -0.62 { return 1 }   // thấp, ngang hông
-        return 0                       // rất thấp, ngang gối trở xuống
-    }
-
-    static func pitch(_ deg: Double) -> Int {
-        if deg >  20 { return 4 }
-        if deg >   8 { return 3 }
-        if deg >= -8 { return 2 }
-        if deg > -20 { return 1 }
-        return 0
-    }
-
-    static func heightAnchorWord(_ bucket: Int) -> String {
-        switch bucket {
-        case 4:  return "cao quá đầu"
-        case 3:  return "ngang đầu"
-        case 2:  return "ngang mắt"
-        case 1:  return "ngang hông"
-        default: return "sát mặt đất"
-        }
-    }
-}
-
-// =====================================================================
-// MARK: - 3. LỌC NHIỄU
-// =====================================================================
-
-/// One Euro Filter — mượt khi đứng yên, bám nhanh khi di chuyển thật.
-nonisolated final class OneEuroFilter {
+final class OneEuroFilter {
     private var xPrev: Double?, dxPrev: Double = 0, tPrev: Double?
     private let minCutoff: Double, beta: Double, dCutoff: Double
 
     init(minCutoff: Double = 1.0, beta: Double = 0.015, dCutoff: Double = 1.0) {
         self.minCutoff = minCutoff; self.beta = beta; self.dCutoff = dCutoff
     }
-
     private func alpha(_ cutoff: Double, _ dt: Double) -> Double {
         let tau = 1.0 / (2 * .pi * cutoff); return 1.0 / (1.0 + tau / dt)
     }
-
     func filter(_ x: Double, timestamp t: Double) -> Double {
         guard let xp = xPrev, let tp = tPrev, t > tp else { xPrev = x; tPrev = t; return x }
         let dt = t - tp
@@ -588,134 +370,149 @@ nonisolated final class OneEuroFilter {
         xPrev = xHat; dxPrev = dxHat; tPrev = t
         return xHat
     }
-
     func reset() { xPrev = nil; dxPrev = 0; tPrev = nil }
 }
 
-/// Median trượt — dùng cho đại lượng có outlier nhọn (keypoint nhảy 1 frame).
-nonisolated struct RollingMedian {
+struct RollingMedian {
     private var buf: [Double] = []
     let size: Int
-
     init(size: Int = 5) { self.size = size }
-
     mutating func push(_ v: Double) -> Double {
         buf.append(v); if buf.count > size { buf.removeFirst() }
         return buf.sorted()[buf.count / 2]
     }
-
     mutating func reset() { buf.removeAll() }
 }
 
 // =====================================================================
-// MARK: - 4. ĐO ĐẠC TỪ FRAME (Vision + CoreMotion)
+// MARK: - 3. ĐO ĐẠC TỪ FRAME (Vision + CoreMotion)
 // =====================================================================
 
-nonisolated final class Measurer {
+final class Measurer {
 
     private let cfg: GuidanceConfig
     private let poseRequest = VNDetectHumanBodyPoseRequest()
     private let faceRequest: VNDetectFaceRectanglesRequest = {
         let r = VNDetectFaceRectanglesRequest()
-        r.revision = VNDetectFaceRectanglesRequestRevision3   // revision 3 mới có yaw
+        r.revision = VNDetectFaceRectanglesRequestRevision3
         return r
     }()
 
-    // Hiệu chuẩn tỉ lệ vai/thân khi mẫu chính diện
     private var rFront: Double?
     private var rFrontSamples: [Double] = []
 
-    // Cache face (face chạy thưa hơn pose)
     private var lastFace: VNFaceObservation?
     private var lastFaceTime: Double = -1
 
-    // Bộ lọc — pitch được lọc RIÊNG (v1 bỏ sót, gây rung mục 4)
     private var fShoulderRatio = OneEuroFilter(minCutoff: 0.8, beta: 0.010)
-    private var fSizeRatio     = OneEuroFilter(minCutoff: 1.0, beta: 0.015)
+    private var fScale         = OneEuroFilter(minCutoff: 1.0, beta: 0.015)
     private var fCenterX       = OneEuroFilter(minCutoff: 1.0, beta: 0.020)
-    private var fHeadTopY      = OneEuroFilter(minCutoff: 1.0, beta: 0.015)
+    private var fElevation     = OneEuroFilter(minCutoff: 1.0, beta: 0.015)
     private var fPitch         = OneEuroFilter(minCutoff: 1.2, beta: 0.010)
     private var mSpine         = RollingMedian(size: 5)
 
     private var validFrames = 0
-    private var missStreak = 0
 
-    init(config: GuidanceConfig = .default) { self.cfg = config }
+    init(config: GuidanceConfig) { self.cfg = config }
 
     func reset() {
         rFront = nil; rFrontSamples.removeAll()
         lastFace = nil; lastFaceTime = -1
-        validFrames = 0; missStreak = 0
-        fShoulderRatio.reset(); fSizeRatio.reset(); fCenterX.reset()
-        fHeadTopY.reset(); fPitch.reset(); mSpine.reset()
+        validFrames = 0
+        fShoulderRatio.reset(); fScale.reset(); fCenterX.reset()
+        fElevation.reset(); fPitch.reset(); mSpine.reset()
     }
 
-    /// Mất subject: chỉ reset chuỗi "frame hợp lệ" khi mất LIÊN TỤC ~0.3s.
-    /// Detect yếu vài frame (che khuất, rung) không được phép tê liệt hướng dẫn.
-    private func noteSubjectLost() {
-        missStreak += 1
-        if missStreak > 10 {
-            validFrames = 0
-            missStreak = 0
-        }
-    }
-
-    /// Đo 1 frame.
-    /// - parameter framing: lớp khung hình từ template (suy 1 lần, áp nguyên xi).
-    ///   Với lớp chân dung (chest/head) KHÔNG đòi hông — chỉ cần vai + mặt.
+    /// Đo 1 frame LIVE (camera đang chạy) — có lọc mượt + IMU.
     func measure(pixelBuffer: CVPixelBuffer,
                  deviceMotion: CMDeviceMotion?,
                  optics: CameraOptics,
                  orientation: CGImagePropertyOrientation,
                  timestamp: Double,
-                 runFace: Bool,
-                 framing: FramingClass) -> Measurement {
+                 framing: FramingClass,
+                 runFace: Bool) -> Measurement {
 
-        var m = Measurement(timestamp: timestamp, framing: framing)
+        var m = Measurement(timestamp: timestamp)
 
-        // ---------- Góc máy từ TRỌNG LỰC ----------
+        // ---------- Góc máy từ TRỌNG LỰC (không dùng attitude.pitch — bị
+        // gimbal lock khi cầm máy dựng đứng, và phụ thuộc reference frame) ----------
         if let dm = deviceMotion {
             let g = dm.gravity
-            // Trục quang camera sau = −z của device. Góc ngẩng so với mặt phẳng ngang:
-            //   elevation = asin(g.z)   (hướng lên = −g)
-            // KHÔNG dùng attitude.pitch: phụ thuộc reference frame, bị gimbal lock.
             let rawPitch = asin(max(-1, min(1, g.z))).degrees
             m.cameraPitchDeg = fPitch.filter(rawPitch, timestamp: timestamp)
-            // Vẹo chân trời (cầm dọc): chỉ đọc để tự nắn ảnh, KHÔNG hướng dẫn.
             m.rollDeg = atan2(g.x, -g.y).degrees
             let rr = dm.rotationRate
             m.angularSpeedDegPerSec = sqrt(rr.x*rr.x + rr.y*rr.y + rr.z*rr.z).degrees
         }
 
-        // ---------- Vision ----------
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer,
-                                            orientation: orientation, options: [:])
+        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: orientation)
         var requests: [VNRequest] = [poseRequest]
         if runFace { requests.append(faceRequest) }
         try? handler.perform(requests)
 
-        // Keypoint cho skeleton overlay — độc lập với việc có template hay không.
-        if let allPts = try? poseRequest.results?.first?.recognizedPoints(.all), !allPts.isEmpty {
-            m.jointPoints = allPts.reduce(into: [:]) { dict, entry in
-                guard entry.value.confidence >= cfg.minKeypointConfidenceDisplay else { return }
-                dict[entry.key] = JointPoint(location: entry.value.location,
-                                             confidence: entry.value.confidence)
-            }
-        }
-
-        if runFace, let f = faceRequest.results?.first {
-            lastFace = f; lastFaceTime = timestamp
-        }
+        if runFace, let f = faceRequest.results?.first { lastFace = f; lastFaceTime = timestamp }
         let face: VNFaceObservation? =
             (timestamp - lastFaceTime <= cfg.faceCacheSeconds) ? lastFace : nil
 
         guard let obs = poseRequest.results?.first,
               let pts = try? obs.recognizedPoints(.all) else {
-            noteSubjectLost()
+            validFrames = 0
             return m
         }
 
-        // Lấy keypoint, LẬT Y (Vision gốc dưới-trái → ta dùng gốc trên-trái)
+        measureCore(pts: pts, face: face, framing: framing, timestamp: timestamp,
+                    optics: optics, filtered: true, into: &m)
+        return m
+    }
+
+    /// Phân tích ẢNH MẪU khi CHƯA BIẾT lớp khung hình: chạy Vision 1 lần, suy
+    /// `FramingClass` từ khung bao chủ thể, rồi đo lại theo ĐÚNG mốc của lớp đó.
+    /// Dùng cho `TemplateAnalyzer`.
+    func analyzeStillWithFraming(cgImage: CGImage) -> (Measurement, FramingClass)? {
+        let poseReq = VNDetectHumanBodyPoseRequest()
+        let faceReq = faceRequest
+        let handler = VNImageRequestHandler(cgImage: cgImage, orientation: .up)
+        try? handler.perform([poseReq, faceReq])
+        guard let obs = poseReq.results?.first,
+              let pts = try? obs.recognizedPoints(.all) else { return nil }
+        guard let box = Measurer.subjectBox(pts: pts, minConf: cfg.minKeypointConfidenceLimb) else { return nil }
+
+        let cls = FramingClass.detect(subjectBox: box)
+        let face = faceReq.results?.first
+        let optics = CameraOptics(hFovDeg: cfg.referenceVFOVDegrees * 0.6,
+                                  vFovDeg: cfg.referenceVFOVDegrees,
+                                  focalPixels: 1000, imageWidthPixels: 1000, imageHeightPixels: 1000)
+        var m = Measurement(timestamp: 0)
+        measureCore(pts: pts, face: face, framing: cls, timestamp: 0, optics: optics, filtered: false, into: &m)
+        return (m, cls)
+    }
+
+    /// Khung bao chủ thể (0...1, gốc trên-trái) — dùng để suy FramingClass.
+    /// Lọc CẢ confidence LẪN toạ độ y trong 0...1 (Vision ngoại suy điểm ngoài
+    /// khung với confidence thấp — bẫy tài liệu §3 cảnh báo).
+    static func subjectBox(pts: [VNHumanBodyPoseObservation.JointName: VNRecognizedPoint],
+                           minConf: Float) -> CGRect? {
+        var xs: [Double] = [], ys: [Double] = []
+        for (_, p) in pts where p.confidence >= minConf {
+            let y = 1.0 - Double(p.location.y)
+            guard y >= 0, y <= 1, p.location.x >= 0, p.location.x <= 1 else { continue }
+            xs.append(Double(p.location.x)); ys.append(y)
+        }
+        guard let x0 = xs.min(), let x1 = xs.max(), let y0 = ys.min(), let y1 = ys.max() else { return nil }
+        return CGRect(x: x0, y: y0, width: x1 - x0, height: y1 - y0)
+    }
+
+    // -------------------------------------------------------------
+    // Lõi đo dùng chung cho live + still
+    // -------------------------------------------------------------
+    private func measureCore(pts: [VNHumanBodyPoseObservation.JointName: VNRecognizedPoint],
+                             face: VNFaceObservation?,
+                             framing: FramingClass,
+                             timestamp: Double,
+                             optics: CameraOptics,
+                             filtered: Bool,
+                             into m: inout Measurement) {
+
         func p(_ n: VNHumanBodyPoseObservation.JointName, _ minConf: Float) -> SIMD2<Double>? {
             guard let q = pts[n], q.confidence >= minConf else { return nil }
             return SIMD2(Double(q.location.x), 1.0 - Double(q.location.y))
@@ -723,165 +520,131 @@ nonisolated final class Measurer {
         let core = cfg.minKeypointConfidenceCore
         let limb = cfg.minKeypointConfidenceLimb
 
-        // Fallback mềm 2 bậc: core → limb → floor. Không có fallback này, chỉ 1 frame
-        // detect yếu cũng tắt toàn bộ hướng dẫn (đây là lý do thực tế khiến cue
-        // "biến mất" và badge báo "không tìm thấy người" dù người vẫn đứng trong khung).
-        //
-        // RẠCH RÒI THEO LỚP: chân dung (chest/head) chỉ cần VAI + (mặt), KHÔNG đòi hông.
-        // Hông của ảnh bán thân thường ngoài khung → đòi hông sẽ làm hướng dẫn tê liệt.
-        let torsoFloor = cfg.minKeypointConfidenceTorsoFloor
-        guard let lSh = p(.leftShoulder, core) ?? p(.leftShoulder, limb) ?? p(.leftShoulder, torsoFloor),
-              let rSh = p(.rightShoulder, core) ?? p(.rightShoulder, limb) ?? p(.rightShoulder, torsoFloor) else {
-            noteSubjectLost()   // suy giảm êm — chỉ reset chuỗi khi mất thật sự
-            return m
+        if filtered {
+            m.jointPoints = pts.reduce(into: [:]) { dict, entry in
+                let (name, point) = entry
+                guard point.confidence >= 0.1 else { return }
+                dict[name] = JointPoint(location: point.location, confidence: point.confidence)
+            }
         }
-        let needHip = framing.requiresHip
-        let lHip = needHip ? (p(.leftHip, core) ?? p(.leftHip, limb) ?? p(.leftHip, torsoFloor)) : nil
-        let rHip = needHip ? (p(.rightHip, core) ?? p(.rightHip, limb) ?? p(.rightHip, torsoFloor)) : nil
-        guard !needHip || (lHip != nil && rHip != nil) else {
-            noteSubjectLost()
-            return m
+
+        guard let lSh = p(.leftShoulder, core), let rSh = p(.rightShoulder, core) else {
+            if filtered { validFrames = 0 }
+            return
         }
-        missStreak = 0
-        validFrames += 1
-        guard validFrames >= cfg.minValidFramesBeforeUse else { return m }
+        let lHip = p(.leftHip, core), rHip = p(.rightHip, core)
+        let hips: SIMD2<Double>? = (lHip != nil && rHip != nil) ? (lHip! + rHip!) / 2 : nil
+
+        if filtered {
+            validFrames += 1
+            guard validFrames >= cfg.minValidFramesBeforeUse else { return }
+        }
 
         m.hasSubject = true
-        m.includesHip = (lHip != nil && rHip != nil)
         let neck = (lSh + rSh) / 2
-        let hips: SIMD2<Double>? = (lHip != nil && rHip != nil) ? (lHip! + rHip!) / 2 : nil
         let nose = p(.nose, limb)
         let torsoHeight = hips.map { abs(neck.y - $0.y) } ?? 0
 
-        // ---------- MỤC 5: tâm thân theo chiều ngang — theo lớp ----------
-        switch framing {
-        case .head:
-            if let f = face { m.torsoCenterX = fCenterX.filter(Double(f.boundingBox.midX), timestamp: timestamp) }
-            else { m.torsoCenterX = fCenterX.filter(neck.x, timestamp: timestamp) }
-        case .chest:
-            m.torsoCenterX = fCenterX.filter(neck.x, timestamp: timestamp)
-        case .full, .knee, .half:
-            if let h = hips { m.torsoCenterX = fCenterX.filter((neck.x + h.x) / 2, timestamp: timestamp) }
-            else { m.torsoCenterX = fCenterX.filter(neck.x, timestamp: timestamp) }
-        }
-
-        // ---------- Đỉnh đầu — ba đường lấy, ưu tiên giảm dần ----------
+        // ---------- Đỉnh đầu — ưu tiên face box, sau đó nhân trắc ----------
         var headTopY: Double?
         if let f = face {
-            // boundingBox gốc dưới-trái → mép trên sau khi lật Y
             headTopY = 1.0 - Double(f.boundingBox.origin.y + f.boundingBox.height)
         } else if torsoHeight > 0.02 {
-            // Nhân trắc: đỉnh đầu cách cổ 0.18H, vai→hông = 0.29H ⇒ hệ số 0.62
             headTopY = neck.y - 0.62 * torsoHeight
         } else if let nose = nose {
             headTopY = nose.y - 0.6 * abs(nose.y - neck.y)
         }
-        if let h = headTopY { headTopY = fHeadTopY.filter(h, timestamp: timestamp) }
 
-        // ---------- MỤC 1: hướng mẫu — theo nguồn của LỚP ----------
-        switch framing.yawSource {
-        case .faceYaw:
-            // CHEST/HEAD: hông khuất nên dùng face yaw (chính xác hơn cả vai).
-            if let f = face, let yaw = f.yaw?.doubleValue {
-                m.bodyYawDeg = yaw.degrees
-        } else if let nose, hips != nil, torsoHeight >= cfg.bodyYawMinTorsoHeight {
-            m.bodyYawDeg = nose.x > neck.x ? 1 : -1   // dự phòng thô
+        // ---------- Tâm chủ thể (mục 5) — ĐÚNG MỐC CỦA LỚP ----------
+        switch framing.centerAnchor {
+        case .torsoCenter:
+            if let hips = hips { let c = (neck + hips) / 2; m.centerX = c.x; m.centerY = c.y }
+            else { m.centerX = neck.x; m.centerY = neck.y }
+        case .shoulderCenter:
+            m.centerX = neck.x; m.centerY = neck.y
+        case .faceCenter:
+            if let f = face { m.centerX = Double(f.boundingBox.midX); m.centerY = 1.0 - Double(f.boundingBox.midY) }
+            else { m.centerX = neck.x; m.centerY = neck.y }
         }
-    case .shoulderForeshortening:
-        if hips != nil, torsoHeight >= cfg.bodyYawMinTorsoHeight {
-                let rawR = abs(lSh.x - rSh.x) / torsoHeight
-                let r = fShoulderRatio.filter(rawR, timestamp: timestamp)   // LỌC TRƯỚC acos
+        if filtered, let cx = m.centerX { m.centerX = fCenterX.filter(cx, timestamp: timestamp) }
 
-                // Hiệu chuẩn r_front: khi thấy mặt gần chính diện
-                if rFront == nil, let f = face,
-                   let yaw = f.yaw?.doubleValue, abs(yaw.degrees) < 10 {
+        // ---------- Tỉ lệ chủ thể (mục 2) — ĐÚNG MỐC CỦA LỚP ----------
+        let ankleY = [p(.leftAnkle, limb)?.y, p(.rightAnkle, limb)?.y].compactMap { $0 }.max()
+        let kneeY  = [p(.leftKnee,  limb)?.y, p(.rightKnee,  limb)?.y].compactMap { $0 }.max()
+        var scale: Double?
+        switch framing.scaleAnchor {
+        case .headToAnkle:
+            if let top = headTopY, let a = ankleY, a > top { scale = a - top }
+        case .headToKnee:
+            if let top = headTopY, let k = kneeY, k > top { scale = k - top }
+        case .headToHip:
+            if let top = headTopY, let h = hips?.y, h > top { scale = h - top }
+        case .faceHeight:
+            if let f = face { scale = Double(f.boundingBox.height) }
+            else { scale = abs(lSh.x - rSh.x) * 0.55 }   // dự phòng: suy từ bề ngang vai
+        }
+        if let s = scale {
+            m.scaleValue = filtered ? fScale.filter(s, timestamp: timestamp) : s
+        }
+
+        // ---------- Hướng mẫu (mục 1) — nguồn ĐÚNG THEO LỚP ----------
+        switch framing.yawSource {
+        case .shoulderForeshortening:
+            if torsoHeight >= cfg.bodyYawMinTorsoHeight {
+                let rawR = abs(lSh.x - rSh.x) / torsoHeight
+                let r = filtered ? fShoulderRatio.filter(rawR, timestamp: timestamp) : rawR
+
+                if rFront == nil, let f = face, let yaw = f.yaw?.doubleValue, abs(yaw.degrees) < 10 {
                     rFrontSamples.append(r)
                     if rFrontSamples.count >= 10 {
                         rFront = rFrontSamples.sorted()[rFrontSamples.count / 2]
                     }
                 }
-                let base = rFront ?? cfg.defaultRFront
+                let base = rFront ?? cfg.rFrontDefault
                 let ratio = min(max(r / base, 0), 1)
 
                 if ratio >= cfg.bodyYawFrontalDeadZone {
-                    // Vùng chết chính diện — acos ở đây khuếch đại nhiễu, không tính góc.
                     m.bodyYawDeg = 0
                     m.bodyYawIsFrontalFlat = true
                 } else {
                     let absYaw = acos(ratio).degrees
                     var signedYaw = absYaw
                     if let nose = nose { signedYaw = (nose.x > neck.x) ? absYaw : -absYaw }
-                    // Trước/sau: thấy mặt ⇒ chắc chắn nửa trước; không thì suy từ thứ tự vai
                     let seeingFront = (face != nil) || (lSh.x > rSh.x)
-                    m.bodyYawDeg = seeingFront
-                        ? signedYaw
+                    m.bodyYawDeg = seeingFront ? signedYaw
                         : (signedYaw >= 0 ? 180 - absYaw : -180 + absYaw)
                 }
             }
+        case .faceYaw:
+            if let f = face, let yaw = f.yaw?.doubleValue { m.bodyYawDeg = yaw.degrees }
         }
-
-        // ---------- MỤC 2: xa/gần — DÙNG ĐÚNG MỐC của LỚP ----------
-        let ankleY = [p(.leftAnkle, limb)?.y, p(.rightAnkle, limb)?.y].compactMap { $0 }.max()
-        let kneeY  = [p(.leftKnee,  limb)?.y, p(.rightKnee,  limb)?.y].compactMap { $0 }.max()
-        let scaleAnchor = framing.scaleAnchor
-
-        var span: Double?
-        var anchor: HeightAnchor?
-        if scaleAnchor == .faceHeight {
-            // CHEST/HEAD: chiều cao khung mặt.
-            if let f = face {
-                span = Double(f.boundingBox.height); anchor = .faceHeight
-            } else {
-                span = abs(lSh.x - rSh.x) * 0.55; anchor = .faceHeight
-            }
-        } else if let top = headTopY {
-            if scaleAnchor == .headToAnkle, let a = ankleY, a > top { span = a - top; anchor = .headToAnkle }
-            else if scaleAnchor == .headToKnee, let k = kneeY, k > top { span = k - top; anchor = .headToKnee }
-            else if scaleAnchor == .headToHip, let h = hips, h.y > top { span = h.y - top; anchor = .headToHip }
-        }
-
-        if let span = span, let anchor = anchor {
-            let smoothed = fSizeRatio.filter(span, timestamp: timestamp)
-            m.heightAnchor = anchor
-            m.sizeRatio = smoothed
-            if anchor.isFullHeightScalable {
-                let fullPx = (smoothed / anchor.factorOfFullHeight) * optics.imageHeightPixels
-                m.fullHeightPixels = fullPx
-                if fullPx > 1 {
-                    // Ước lượng thô, CHỈ dùng để đổi % → "bước". Không dùng để so ngưỡng.
-                    m.distanceMeters = optics.focalPixels * cfg.assumedBodyHeightMeters / fullPx
-                }
-
-                // ---------- MỤC 3: máy cao/thấp, ĐƠN VỊ CHIỀU CAO MẪU ----------
-                // rel = −f·tan(góc ngẩng tới đỉnh đầu) / chiều-cao-mẫu-pixel.
-                if let top = headTopY, fullPx > 1 {
-                    let elev = m.cameraPitchDeg + optics.elevationOffsetDeg(normalizedY: top)
-                    m.cameraHeightRel = -optics.focalPixels * tan(elev.radians) / fullPx
-                }
-            }
-        }
-
-        // ---------- MỤC 6: dáng — CHỈ nhóm khớp THUỘC LỚP ----------
-        if let h = hips, torsoHeight > 1e-6 {
-            m.spineTiltDeg = mSpine.push(atan2(neck.x - h.x, max(torsoHeight, 1e-6)).degrees)
-        } else {
-            m.spineTiltDeg = mSpine.push(0)
-        }
-        m.jointAngles = Self.jointAngles(pts: pts, minConf: limb,
-                                         groups: framing.poseGroups, includeHip: m.includesHip)
         if let f = face, let yaw = f.yaw?.doubleValue { m.headYawDeg = yaw.degrees }
 
-        return m
+        // ---------- Góc nhìn tới mốc (mục 3) — ĐỘC LẬP với mục 4 ----------
+        // elevation = pitch_máy + (0.5 − y_mốc) × vFOV. Hai phương trình
+        // (mục 3 + mục 4) độc lập, cùng xác định đủ độ cao máy lẫn độ chúc.
+        var anchorY: Double?
+        switch framing.elevationAnchor {
+        case .midHip:   anchorY = hips?.y
+        case .midTorso: anchorY = hips.map { (neck.y + $0.y) / 2 } ?? neck.y
+        case .eyeLine:  anchorY = face.map { 1.0 - Double($0.boundingBox.midY) } ?? nose?.y
+        }
+        if let ay = anchorY {
+            let offset = optics.elevationOffsetDeg(normalizedY: ay)
+            let raw = m.cameraPitchDeg + offset
+            m.elevationDeg = filtered ? fElevation.filter(raw, timestamp: timestamp) : raw
+        }
+
+        // ---------- Dáng ----------
+        if let hips = hips {
+            let rawSpine = atan2(neck.x - hips.x, max(torsoHeight, 1e-6)).degrees
+            m.spineTiltDeg = filtered ? mSpine.push(rawSpine) : rawSpine
+        }
+        m.jointAngles = Self.jointAngles(pts: pts, minConf: limb)
     }
 
-    /// Tính góc tại các khớp, giới hạn theo nhóm khớp THUỘC LỚP khung hình.
-    /// - Parameters:
-    ///   - groups: các nhóm được chấm (spine/head điều khiển bởi caller; ở đây arms/legs).
-    ///   - includeHip: có điểm hông để tính góc vai không (chân dung hông khuất → bỏ vai).
     static func jointAngles(pts: [VNHumanBodyPoseObservation.JointName: VNRecognizedPoint],
-                            minConf: Float,
-                            groups: [PoseGroup] = [.spine, .head, .arms, .legs],
-                            includeHip: Bool = true) -> [JointName: Double] {
+                            minConf: Float) -> [JointName: Double] {
         func p(_ n: VNHumanBodyPoseObservation.JointName) -> SIMD2<Double>? {
             guard let q = pts[n], q.confidence >= minConf else { return nil }
             return SIMD2(Double(q.location.x), 1.0 - Double(q.location.y))
@@ -893,38 +656,28 @@ nonisolated final class Measurer {
             guard denom > 1e-6 else { return nil }
             return acos(min(max(dot(u, w) / denom, -1), 1)).degrees
         }
-        let arms = groups.contains(.arms)
-        let legs = groups.contains(.legs)
         var out: [JointName: Double] = [:]
-        if arms {
-            // Góc vai cần hông làm đỉnh thứ 3 → chỉ tính khi có hông.
-            if includeHip {
-                out[.leftShoulder]  = angle(p(.leftElbow), p(.leftShoulder), p(.leftHip))
-                out[.rightShoulder] = angle(p(.rightElbow), p(.rightShoulder), p(.rightHip))
-            }
-            out[.leftElbow]  = angle(p(.leftShoulder), p(.leftElbow), p(.leftWrist))
-            out[.rightElbow] = angle(p(.rightShoulder), p(.rightElbow), p(.rightWrist))
-        }
-        if legs {
-            out[.leftKnee]  = angle(p(.leftHip), p(.leftKnee), p(.leftAnkle))
-            out[.rightKnee] = angle(p(.rightHip), p(.rightKnee), p(.rightAnkle))
-        }
+        out[.leftElbow]     = angle(p(.leftShoulder), p(.leftElbow),   p(.leftWrist))
+        out[.rightElbow]    = angle(p(.rightShoulder), p(.rightElbow), p(.rightWrist))
+        out[.leftShoulder]  = angle(p(.leftElbow), p(.leftShoulder),   p(.leftHip))
+        out[.rightShoulder] = angle(p(.rightElbow), p(.rightShoulder), p(.rightHip))
+        out[.leftKnee]      = angle(p(.leftHip), p(.leftKnee),   p(.leftAnkle))
+        out[.rightKnee]     = angle(p(.rightHip), p(.rightKnee), p(.rightAnkle))
         return out.compactMapValues { $0 }
     }
 }
 
 // =====================================================================
-// MARK: - 5. TRẠNG THÁI TỪNG MỤC — vùng chết, trễ, khóa, chống kẹt
+// MARK: - 4. TRẠNG THÁI TỪNG MỤC — vùng chết, trễ, khoá, chống kẹt
 // =====================================================================
 
-/// Máy trạng thái cho MỘT tiêu chí. Đây là chỗ dập tắt hiện tượng cue nhấp nháy.
-nonisolated final class CriterionGate {
+final class CriterionGate {
     enum Status { case unknown, passing, failing }
 
     private(set) var status: Status = .unknown
-    private(set) var locked = false               // đã từng đạt
-    private var candidateSince: Double?           // thời điểm bắt đầu ở trạng thái ngược lại
-    private var blockedGateSince: Double?         // đang chặn cổng chụp từ lúc nào
+    private(set) var locked = false
+    private var candidateSince: Double?
+    private var blockedGateSince: Double?
 
     let band: ThresholdBand
     let config: GuidanceConfig
@@ -938,21 +691,14 @@ nonisolated final class CriterionGate {
         candidateSince = nil; blockedGateSince = nil
     }
 
-    /// - Parameters:
-    ///   - error: sai số theo đơn vị của mục. nil = không đo được → bỏ qua, coi như đạt.
-    ///   - action: lượng phải sửa (cùng đơn vị với band.actionFloor).
     @discardableResult
     func update(error: Double?, action: Double, now: Double) -> (failing: Bool, showCue: Bool) {
-
-        // Không đo được → không phán xét (nguyên tắc PRD: loại mục ra, không trừ điểm)
         guard let raw = error, raw.isFinite else {
             candidateSince = nil
             return (false, false)
         }
         let e = abs(raw)
 
-        // Hành động cần sửa quá nhỏ → im, dù sai số có vượt ngưỡng.
-        // ("Đưa máy sang phải 1cm" là câu vô nghĩa với người cầm máy.)
         if action < band.actionFloor {
             markPassing(now: now)
             return (false, false)
@@ -961,7 +707,6 @@ nonisolated final class CriterionGate {
         let failThreshold: Double = locked ? band.unlock : band.enter
 
         if e > failThreshold {
-            // Ứng viên VI PHẠM — phải kéo dài đủ lâu mới đổi trạng thái
             if status != .failing {
                 if candidateSince == nil { candidateSince = now }
                 if now - candidateSince! >= config.cueEnterHoldSeconds {
@@ -971,12 +716,10 @@ nonisolated final class CriterionGate {
         } else if e <= band.accept {
             markPassing(now: now)
         } else {
-            // VÙNG XÁM (accept < e <= failThreshold): giữ nguyên trạng thái.
             candidateSince = nil
-            if status == .unknown { status = .failing }   // lần đầu thì vẫn nên chỉnh
+            if status == .unknown { status = .failing }
         }
 
-        // Chống kẹt: đã khóa nhưng trôi khỏi accept làm cổng chụp mãi không mở.
         let gateOK = (status == .passing) && e <= band.enter
         if gateOK { blockedGateSince = nil }
         else if blockedGateSince == nil { blockedGateSince = now }
@@ -997,15 +740,14 @@ nonisolated final class CriterionGate {
         } else { candidateSince = nil }
     }
 
-    /// Mục này có đang mở cổng chụp không.
     var passesCaptureGate: Bool { status == .passing }
 }
 
 // =====================================================================
-// MARK: - 6. SINH CÂU CUE (có làm tròn số)
+// MARK: - 5. SINH CÂU CUE (có làm tròn số)
 // =====================================================================
 
-nonisolated enum CueFactory {
+enum CueFactory {
 
     static func quantize(_ v: Double, step: Double) -> Double {
         guard step > 0 else { return v }
@@ -1016,8 +758,7 @@ nonisolated enum CueFactory {
     static func bodyYaw(delta d: Double, targetYaw: Double, cfg: GuidanceConfig) -> String {
         if abs(targetYaw) > 150 { return "Bảo mẫu quay lưng lại" }
         if abs(abs(targetYaw) - 90) < 30 {
-            return targetYaw > 0 ? "Bảo mẫu quay nghiêng sang phải"
-                                 : "Bảo mẫu quay nghiêng sang trái"
+            return targetYaw > 0 ? "Bảo mẫu quay nghiêng sang phải" : "Bảo mẫu quay nghiêng sang trái"
         }
         if abs(targetYaw) < 25 { return "Bảo mẫu quay mặt về phía máy" }
         let deg = quantize(abs(d), step: cfg.quantizeDegrees)
@@ -1035,16 +776,24 @@ nonisolated enum CueFactory {
         return err > 0 ? "Lùi \(steps) bước" : "Tiến \(steps) bước"
     }
 
-    // --- Mục 3 ---
-    static func cameraHeight(relDelta d: Double, fullHeightMeters: Double,
-                             targetBucket: Int, cfg: GuidanceConfig) -> String {
-        let word = Buckets.heightAnchorWord(targetBucket)
-        let cm = quantize(abs(d) * fullHeightMeters * 100, step: cfg.quantizeCentimeters)
-        if cm >= 10 {
-            return d > 0 ? "Hạ điện thoại xuống ~\(Int(cm))cm (\(word))"
-                         : "Nâng điện thoại lên ~\(Int(cm))cm (\(word))"
+    // --- Mục 3 — góc nhìn (độ), universal mọi lớp ---
+    //
+    // ⚠️ CHIỀU DẤU: elevationDeg = pitch_máy + (0.5 − y_mốc)×vFOV là góc TUYỆT
+    // ĐỐI (so mặt phẳng ngang) từ máy tới mốc. Với một điểm mốc CỐ ĐỊNH trong
+    // không gian, góc này CÀNG LỚN khi máy đặt CÀNG THẤP (phải ngẩng lên nhiều
+    // hơn để thấy mốc) — nghịch biến với độ cao máy. Vậy delta = live − template:
+    //   delta > 0  ⇒  máy hiện đang THẤP hơn lúc chụp mẫu ⇒ cần NÂNG lên.
+    //   delta < 0  ⇒  máy hiện đang CAO hơn lúc chụp mẫu ⇒ cần HẠ xuống.
+    // Suy từ hình học thuần, CHƯA kiểm trên máy thật (mục 9 tài liệu verify-v3).
+    // Nếu test thực tế thấy cue nâng/hạ bị ngược, đảo `d > 0` ↔ `d < 0` dưới đây.
+    static func cameraElevation(delta d: Double, anchorLabel: String, cfg: GuidanceConfig) -> String {
+        let deg = quantize(abs(d), step: cfg.quantizeDegrees)
+        if deg < cfg.quantizeDegrees {
+            return d > 0 ? "Nâng ống kính lên một chút (\(anchorLabel))"
+                         : "Hạ ống kính xuống một chút (\(anchorLabel))"
         }
-        return d > 0 ? "Hạ điện thoại xuống (\(word))" : "Nâng điện thoại lên (\(word))"
+        return d > 0 ? "Nâng ống kính lên \(Int(deg))° (\(anchorLabel))"
+                     : "Hạ ống kính xuống \(Int(deg))° (\(anchorLabel))"
     }
 
     // --- Mục 4 ---
@@ -1058,16 +807,14 @@ nonisolated enum CueFactory {
     }
 
     // --- Mục 5 ---
-    static func horizontal(offset: Double, optics: CameraOptics, cfg: GuidanceConfig) -> String {
-        // offset dương = mẫu đang nằm bên PHẢI chỗ cần → phải đưa máy sang phải
-        if abs(offset) >= cfg.panVsStepThreshold {
+    static func horizontal(offset: Double, optics: CameraOptics, cfg: GuidanceConfig,
+                           panVsStepThreshold: Double = 0.15) -> String {
+        if abs(offset) >= panVsStepThreshold {
             return offset > 0 ? "Bước sang phải 1 bước" : "Bước sang trái 1 bước"
         }
-        let deg = quantize(abs(optics.azimuthOffsetDeg(normalizedX: 0.5 + offset)),
-                           step: cfg.quantizeDegrees)
+        let deg = quantize(abs(optics.azimuthOffsetDeg(normalizedX: 0.5 + offset)), step: cfg.quantizeDegrees)
         if deg < cfg.quantizeDegrees {
-            return offset > 0 ? "Đưa điện thoại sang phải một chút"
-                              : "Đưa điện thoại sang trái một chút"
+            return offset > 0 ? "Đưa điện thoại sang phải một chút" : "Đưa điện thoại sang trái một chút"
         }
         return offset > 0 ? "Xoay điện thoại sang phải \(Int(deg)) độ"
                           : "Xoay điện thoại sang trái \(Int(deg)) độ"
@@ -1075,29 +822,23 @@ nonisolated enum CueFactory {
 }
 
 // =====================================================================
-// MARK: - 7. ĐIỀU PHỐI HIỂN THỊ CUE (thời gian tối thiểu, chống nhảy số)
+// MARK: - 6. ĐIỀU PHỐI HIỂN THỊ CUE
 // =====================================================================
 
-nonisolated final class CuePresenter {
+final class CuePresenter {
     private var currentCriterion: Criterion?
     private var currentText: String?
     private var shownAt: Double = 0
     private var lastNumberUpdate: Double = 0
     private let cfg: GuidanceConfig
 
-    init(config: GuidanceConfig = .default) { self.cfg = config }
-
+    init(config: GuidanceConfig) { self.cfg = config }
     func reset() { currentCriterion = nil; currentText = nil; shownAt = 0; lastNumberUpdate = 0 }
 
-    /// - Parameter frozen: true khi máy đang bị lắc mạnh → giữ nguyên cue cũ.
     func present(_ v: Violation?, now: Double, frozen: Bool) -> String? {
         if frozen { return currentText }
+        guard let v = v else { currentCriterion = nil; currentText = nil; return nil }
 
-        guard let v = v else {
-            currentCriterion = nil; currentText = nil
-            return nil
-        }
-        // Cue của mục ưu tiên cao hơn được chen ngang ngay lập tức.
         let higherPriority = currentCriterion.map { v.criterion.rawValue < $0.rawValue } ?? true
         let displayedLongEnough = now - shownAt >= cfg.cueMinDisplaySeconds
 
@@ -1109,7 +850,6 @@ nonisolated final class CuePresenter {
             lastNumberUpdate = now
             return currentText
         }
-        // Cùng mục: chỉ cho phép đổi CHỮ (thường là đổi con số) theo nhịp chậm.
         if v.cue != currentText, now - lastNumberUpdate >= cfg.cueNumberRefreshSeconds {
             currentText = v.cue
             lastNumberUpdate = now
@@ -1119,261 +859,201 @@ nonisolated final class CuePresenter {
 }
 
 // =====================================================================
-// MARK: - 8. ĐÁNH GIÁ THEO THỨ TỰ 1→6
+// MARK: - 7. ĐÁNH GIÁ THEO THỨ TỰ 1→6
 // =====================================================================
 
-nonisolated final class GuidanceEngine {
+final class GuidanceEngine {
 
     private let cfg: GuidanceConfig
     private var gates: [Criterion: CriterionGate] = [:]
-    private let presenter: CuePresenter
+    private var currentClass: FramingClass = .full
 
     init(config: GuidanceConfig = .default) {
         self.cfg = config
-        self.presenter = CuePresenter(config: config)
-        let bands: [Criterion: ThresholdBand] = [
-            .bodyYaw:      config.bodyYaw,
-            .distance:     config.distance,
-            .cameraHeight: config.cameraHeight,
-            .cameraPitch:  config.cameraPitch,
-            .horizontal:   config.horizontal,
-            .pose:         config.jointAngle,
-        ]
-        for (c, band) in bands {
-            gates[c] = CriterionGate(band: band, config: config)
-        }
+        rebuildGates(for: .full)
     }
 
-    func reset() {
-        gates.values.forEach { $0.reset() }
-        presenter.reset()
+    private func rebuildGates(for cls: FramingClass) {
+        let t = cfg.thresholds(for: cls)
+        gates[.bodyYaw]    = CriterionGate(band: t.bodyYaw,    config: cfg)
+        gates[.distance]   = CriterionGate(band: t.distance,   config: cfg)
+        gates[.elevation]  = CriterionGate(band: t.elevation,  config: cfg)
+        gates[.pitch]      = CriterionGate(band: t.pitch,      config: cfg)
+        gates[.horizontal] = CriterionGate(band: t.horizontal, config: cfg)
+        gates[.pose]       = CriterionGate(band: t.jointAngle, config: cfg)
+        currentClass = cls
     }
 
-    /// Cue đã qua CuePresenter (chống nhảy mục/nhảy số) — dùng cho UI realtime.
-    /// Gọi SAU evaluate với cùng timestamp.
-    func stablePrimaryCue(for result: GuidanceResult, now: Double, frozen: Bool) -> String? {
-        presenter.present(result.violations.first, now: now, frozen: frozen)
-    }
+    func reset() { rebuildGates(for: currentClass) }
 
     func evaluate(_ m: Measurement, _ t: Template, _ optics: CameraOptics) -> GuidanceResult {
 
+        if t.framing != currentClass { rebuildGates(for: t.framing) }
+        let bands = cfg.thresholds(for: t.framing)
         let now = m.timestamp
         var violations: [Violation] = []
         var debug: [Criterion: String] = [:]
-        var cues: [Criterion: String] = [:]
-        var horizontalWaiting = false
 
         guard m.hasSubject else {
             let v = Violation(criterion: .bodyYaw, actor: .shooter, error: 0,
-                              normalizedError: 99, detail: "no subject",
-                              cue: "Đưa mẫu vào khung")
-            return GuidanceResult(violations: [v], passedCount: passedCount(),
-                                  readyToCapture: false,
-                                  worstNormalizedError: 99, debug: debug,
-                                  statuses: Criterion.allCases.map {
-                                      CriterionStatus(criterion: $0, state: .unknown, suggestion: nil)
-                                  })
+                              normalizedError: 99, detail: "no subject", cue: "Đưa mẫu vào khung")
+            return GuidanceResult(violations: [v], passedCount: 0, readyToCapture: false,
+                                  worstNormalizedError: 99, debug: debug)
         }
 
         // ---------------- MỤC 1: HƯỚNG MẪU ----------------
         var yawErr: Double?
         if let yaw = m.bodyYawDeg {
-            // Vùng chết chính diện + template cũng chính diện ⇒ khỏi so góc
-            if m.bodyYawIsFrontalFlat && abs(t.bodyYawDeg) < cfg.bodyYaw.accept {
+            if m.bodyYawIsFrontalFlat && abs(t.bodyYawDeg) < bands.bodyYaw.accept {
                 yawErr = 0
             } else {
                 yawErr = signedAngleDelta(yaw, t.bodyYawDeg)
             }
         }
         let g1 = gates[.bodyYaw]!.update(error: yawErr, action: abs(yawErr ?? 0), now: now)
-        debug[.bodyYaw] = fmt(yawErr, cfg.bodyYaw.accept, "°")
+        debug[.bodyYaw] = fmt(yawErr, bands.bodyYaw.accept, "°")
         if g1.failing {
             let d = yawErr ?? 0
-            let cue = CueFactory.bodyYaw(delta: d, targetYaw: t.bodyYawDeg, cfg: cfg)
             violations.append(Violation(
                 criterion: .bodyYaw, actor: .model, error: d,
-                normalizedError: abs(d) / cfg.bodyYaw.accept,
+                normalizedError: abs(d) / bands.bodyYaw.accept,
                 detail: String(format: "lệch %.0f°", d),
-                cue: cue))
-            cues[.bodyYaw] = cue
-            // v2 cũ DỪNG Ở ĐÂY (return sớm) → các mục dưới không bao giờ được gợi ý
-            // khi hướng mẫu sai. Giờ vẫn đo tiếp để gợi ý LIÊN TỤC từng tiêu chí;
-            // thứ tự ưu tiên 1→6 chỉ còn quyết định cue CHÍNH hiển thị to.
+                cue: CueFactory.bodyYaw(delta: d, targetYaw: t.bodyYawDeg, cfg: cfg)))
+            // Mẫu quay sai hướng ⇒ mọi phép so trái/phải bên dưới vô nghĩa. DỪNG.
+            return GuidanceResult(violations: violations, passedCount: 0, readyToCapture: false,
+                                  worstNormalizedError: abs(d) / bands.bodyYaw.accept, debug: debug)
         }
 
-        // ---------------- MỤC 2: XA/GẦN — so cùng mốc HeightAnchor ----------------
+        // ---------------- MỤC 2: XA/GẦN — ĐÚNG MỐC CỦA LỚP ----------------
         var sizeErr: Double?
         var sizeAction: Double = 0
-        if let anchor = m.heightAnchor, let live = m.sizeRatio,
-           let tmpl = t.sizeRatioByAnchor[anchor], tmpl > 0 {
-            sizeErr = live / tmpl - 1.0
-            sizeAction = abs((m.distanceMeters ?? 2.0) * sizeErr!)   // mét cần đi
+        if let live = m.scaleValue, t.scaleValue > 0 {
+            sizeErr = live / t.scaleValue - 1.0
+            let distanceMeters = estimateDistanceMeters(m, t, optics)
+            sizeAction = abs(distanceMeters * sizeErr!)
         }
         let g2 = gates[.distance]!.update(error: sizeErr, action: sizeAction, now: now)
-        debug[.distance] = fmt(sizeErr, cfg.distance.accept, "") + " [\(m.heightAnchor.map { "\($0)" } ?? "n/a")]"
+        debug[.distance] = fmt(sizeErr, bands.distance.accept, "")
         if g2.failing, let e = sizeErr {
             violations.append(Violation(
                 criterion: .distance, actor: .shooter, error: e,
-                normalizedError: abs(e) / cfg.distance.accept,
+                normalizedError: abs(e) / bands.distance.accept,
                 detail: String(format: "chênh %.0f%% (%.2fm)", e * 100, sizeAction),
-                cue: CueFactory.distance(relError: e, distanceMeters: m.distanceMeters, cfg: cfg)))
+                cue: CueFactory.distance(relError: e, distanceMeters: estimateDistanceMeters(m, t, optics), cfg: cfg)))
         }
 
-        // ---------------- MỤC 3: MÁY CAO/THẤP — so SỐ LIÊN TỤC (đơn vị H mẫu) --------
-        var heightErr: Double?
-        var heightAction: Double = 0
-        if let rel = m.cameraHeightRel {
-            heightErr = rel - t.cameraHeightRel
-            heightAction = abs(heightErr!)   // cùng đơn vị với actionFloor: H mẫu
-        }
-        let g3 = gates[.cameraHeight]!.update(error: heightErr, action: heightAction, now: now)
-        debug[.cameraHeight] = fmt(heightErr, cfg.cameraHeight.accept, "H")
-        if g3.failing, let e = heightErr {
-            let fullH = cfg.assumedBodyHeightMeters   // chỉ dùng để đổi ra cm trong CÂU CHỮ
+        // ---------------- MỤC 3: MÁY CAO/THẤP — GÓC NHÌN (độ) ----------------
+        var elevErr: Double?
+        if let live = m.elevationDeg { elevErr = live - t.elevationDeg }
+        let g3 = gates[.elevation]!.update(error: elevErr, action: abs(elevErr ?? 0), now: now)
+        debug[.elevation] = fmt(elevErr, bands.elevation.accept, "°")
+        if g3.failing, let e = elevErr {
             violations.append(Violation(
-                criterion: .cameraHeight, actor: .shooter, error: e,
-                normalizedError: abs(e) / cfg.cameraHeight.accept,
-                detail: String(format: "lệch %.3fH (~%.0fcm)", e, e * fullH * 100),
-                cue: CueFactory.cameraHeight(relDelta: e, fullHeightMeters: fullH,
-                                             targetBucket: t.cameraHeightBucket, cfg: cfg)))
+                criterion: .elevation, actor: .shooter, error: e,
+                normalizedError: abs(e) / bands.elevation.accept,
+                detail: String(format: "lệch %.1f°", e),
+                cue: CueFactory.cameraElevation(delta: e, anchorLabel: t.framing.elevationAnchor.cueLabel, cfg: cfg)))
         }
 
-        // ---------------- MỤC 4: NGỬA/CHÚC — so SỐ LIÊN TỰC (độ, gốc = ngang) --------
+        // ---------------- MỤC 4: NGỬA/CHÚC ----------------
         let pitchErr = m.cameraPitchDeg - t.cameraPitchDeg
-        let g4 = gates[.cameraPitch]!.update(error: pitchErr, action: abs(pitchErr), now: now)
-        debug[.cameraPitch] = fmt(pitchErr, cfg.cameraPitch.accept, "°")
+        let g4 = gates[.pitch]!.update(error: pitchErr, action: abs(pitchErr), now: now)
+        debug[.pitch] = fmt(pitchErr, bands.pitch.accept, "°")
         if g4.failing {
             violations.append(Violation(
-                criterion: .cameraPitch, actor: .shooter, error: pitchErr,
-                normalizedError: abs(pitchErr) / cfg.cameraPitch.accept,
+                criterion: .pitch, actor: .shooter, error: pitchErr,
+                normalizedError: abs(pitchErr) / bands.pitch.accept,
                 detail: String(format: "lệch %.1f°", pitchErr),
                 cue: CueFactory.cameraPitch(delta: pitchErr, cfg: cfg)))
         }
 
-        // ---------------- MỤC 5: TRÁI/PHẢI — hiệu X tâm thân ----------------
+        // ---------------- MỤC 5: TRÁI/PHẢI ----------------
         var offErr: Double?
-        if let cx = m.torsoCenterX {
-            if let ye = yawErr, abs(ye) > 90 {
-                // Mẫu đang quay lưng/nghiêng quá nửa vòng ⇒ trục trái/phải nhìn thấy
-                // bị ĐẢO NGƯỢC → không gợi ý mù, đánh dấu "chờ hướng đúng".
-                horizontalWaiting = true
-                debug[.horizontal] = "chờ hướng mẫu đúng"
-            } else {
-                offErr = cx - t.torsoCenterX
-            }
-        }
-        let g5 = horizontalWaiting
-            ? gates[.horizontal]!.update(error: nil, action: 0, now: now)
-            : gates[.horizontal]!.update(error: offErr, action: abs(offErr ?? 0), now: now)
-        if !horizontalWaiting {
-            debug[.horizontal] = fmt(offErr, cfg.horizontal.accept, "W")
-        }
+        if let cx = m.centerX { offErr = cx - t.centerX }
+        let g5 = gates[.horizontal]!.update(error: offErr, action: abs(offErr ?? 0), now: now)
+        debug[.horizontal] = fmt(offErr, bands.horizontal.accept, "W")
         if g5.failing, let e = offErr {
-            let cue = CueFactory.horizontal(offset: e, optics: optics, cfg: cfg)
             violations.append(Violation(
                 criterion: .horizontal, actor: .shooter, error: e,
-                normalizedError: abs(e) / cfg.horizontal.accept,
+                normalizedError: abs(e) / bands.horizontal.accept,
                 detail: String(format: "lệch %.1f%% khung", e * 100),
-                cue: cue))
-            cues[.horizontal] = cue
+                cue: CueFactory.horizontal(offset: e, optics: optics, cfg: cfg)))
         }
 
-        // ---------------- MỤC 6: DÁNG — LUÔN ĐO (bản cũ bỏ qua khi 1–5 còn lỗi
-        // nên bảng gợi ý liên tục thiếu mục quan trọng nhất) ----------------
-        if let (err, cue, name) = poseDeviation(m, t) {
-            let g6 = gates[.pose]!.update(error: err, action: abs(err), now: now)
-            debug[.pose] = fmt(err, cfg.jointAngle.accept, "° \(name)")
-            if g6.failing {
-                violations.append(Violation(
-                    criterion: .pose, actor: .model, error: err,
-                    normalizedError: abs(err) / cfg.jointAngle.accept,
-                    detail: String(format: "%@ lệch %.0f°", name, err),
-                    cue: cue))
-                cues[.pose] = cue
+        // ---------------- MỤC 6: DÁNG (chỉ khi 1-5 sạch, chỉ nhóm thuộc lớp) ----------------
+        if violations.isEmpty {
+            if let (err, cue, name) = poseDeviation(m, t, bands: bands) {
+                let g6 = gates[.pose]!.update(error: err, action: abs(err), now: now)
+                debug[.pose] = fmt(err, bands.jointAngle.accept, "° \(name)")
+                if g6.failing {
+                    violations.append(Violation(
+                        criterion: .pose, actor: .model, error: err,
+                        normalizedError: abs(err) / bands.jointAngle.accept,
+                        detail: String(format: "%@ lệch %.0f°", name, err), cue: cue))
+                }
+            } else {
+                gates[.pose]!.update(error: 0, action: 0, now: now)
+                debug[.pose] = "ok"
             }
-        } else {
-            gates[.pose]!.update(error: 0, action: 0, now: now)
-            debug[.pose] = "ok"
         }
 
-        let worst = violations.map { $0.normalizedError }.max() ?? 0
-        return finalize(violations: violations, debug: debug, cues: cues,
-                        horizontalWaiting: horizontalWaiting, worst: worst)
-    }
-
-    private func finalize(violations: [Violation], debug: [Criterion: String],
-                          cues: [Criterion: String], horizontalWaiting: Bool,
-                          worst: Double) -> GuidanceResult {
-        let vs = violations.sorted { $0.criterion.rawValue < $1.criterion.rawValue }
-        // Trạng thái từng mục cho checklist liên tục.
-        let statuses: [CriterionStatus] = Criterion.allCases.sorted { $0.rawValue < $1.rawValue }
-            .map { c in
-                if let cue = cues[c] {
-                    return CriterionStatus(criterion: c, state: .violated, suggestion: cue)
-                }
-                switch gates[c]!.status {
-                case .passing:
-                    return CriterionStatus(criterion: c, state: .ok, suggestion: nil)
-                case .failing:
-                    // Đang trong cửa sổ debounce — chưa đủ dữ kiện đổi trạng thái.
-                    return CriterionStatus(criterion: c, state: .violated, suggestion: nil)
-                case .unknown:
-                    let state: CriterionStatus.State =
-                        (horizontalWaiting && c == .horizontal) ? .waiting : .unknown
-                    return CriterionStatus(criterion: c, state: state, suggestion: nil)
-                }
-            }
-        let ready = vs.isEmpty
+        // ---------------- TỔNG HỢP ----------------
+        let passed = Criterion.allCases.filter { gates[$0]!.passesCaptureGate }.count
+        let calmEnough = m.angularSpeedDegPerSec <= cfg.maxAngularSpeedDegPerSec
+        let ready = violations.isEmpty
             && Criterion.allCases.allSatisfy { gates[$0]!.passesCaptureGate }
-        return GuidanceResult(violations: vs, passedCount: passedCount(),
-                              readyToCapture: ready,
-                              worstNormalizedError: worst, debug: debug,
-                              statuses: statuses)
+            && calmEnough
+        let worst = violations.map { $0.normalizedError }.max() ?? 0
+
+        return GuidanceResult(violations: violations.sorted { $0.criterion.rawValue < $1.criterion.rawValue },
+                              passedCount: passed, readyToCapture: ready,
+                              worstNormalizedError: worst, debug: debug)
     }
 
-    private func passedCount() -> Int {
-        Criterion.allCases.filter { gates[$0]!.passesCaptureGate }.count
+    /// Ước lượng thô khoảng cách (mét) — CHỈ để đổi % → "bước" trong câu chữ.
+    private func estimateDistanceMeters(_ m: Measurement, _ t: Template, _ optics: CameraOptics) -> Double {
+        guard let scale = m.scaleValue, scale > 0, t.framing.scaleAnchor != .faceHeight else { return 2.0 }
+        let fullHeightPx = scale * optics.imageHeightPixels
+        guard fullHeightPx > 1 else { return 2.0 }
+        return optics.focalPixels * cfg.assumedBodyHeightMeters / fullHeightPx
     }
 
-    /// Dáng: trục thân → đầu → tay → chân. Trả về sai lệch NẶNG NHẤT theo thứ tự.
-    /// RẠCH RÒI THEO LỚP: chỉ chấm các nhóm khớp thuộc `t.framing.poseGroups`.
-    private func poseDeviation(_ m: Measurement, _ t: Template) -> (Double, String, String)? {
-        let groups = t.framing.poseGroups
-        // 6a. Trục thân
+    /// Dáng: chỉ chấm các nhóm khớp thuộc `t.framing.poseGroups` — trục thân →
+    /// đầu → tay → chân. Trả về sai lệch NẶNG NHẤT theo thứ tự.
+    private func poseDeviation(_ m: Measurement, _ t: Template, bands: ClassThresholds) -> (Double, String, String)? {
+        let groups = Set(t.framing.poseGroups)
+
         if groups.contains(.spine), let s = m.spineTiltDeg {
             let d = s - t.spineTiltDeg
-            if abs(d) > cfg.spineTilt.enter {
+            if abs(d) > bands.spineTilt.enter {
                 return (d, d > 0 ? "Bảo mẫu nghiêng người sang trái"
                                  : "Bảo mẫu nghiêng người sang phải", "trục thân")
             }
         }
-        // 6b. Đầu
         if groups.contains(.head), let tH = t.headYawDeg, let mH = m.headYawDeg {
             let d = signedAngleDelta(mH, tH)
-            if abs(d) > cfg.headYaw.enter {
+            if abs(d) > bands.headYaw.enter {
                 return (d, d > 0 ? "Bảo mẫu quay mặt sang trái"
                                  : "Bảo mẫu quay mặt sang phải", "hướng đầu")
             }
         }
-        // 6c. Tay (nhóm .arms) rồi 6d. Chân (nhóm .legs) — chỉ khớp thuộc lớp.
-        let order: [JointName] = [.leftShoulder, .rightShoulder, .leftElbow, .rightElbow,
-                                  .leftKnee, .rightKnee]
-        for j in order where Self.jointGroup(j) == .arms ? groups.contains(.arms) : groups.contains(.legs) {
-            guard let cur = m.jointAngles[j], let target = t.jointAngles[j] else { continue }
-            let d = cur - target
-            if abs(d) > cfg.jointAngle.enter {
-                return (d, t.cueForModel, j.rawValue)
+        if groups.contains(.arms) {
+            for j: JointName in [.leftShoulder, .rightShoulder, .leftElbow, .rightElbow] {
+                guard let cur = m.jointAngles[j], let target = t.jointAngles[j] else { continue }
+                if abs(cur - target) > bands.jointAngle.enter {
+                    return (cur - target, t.cueForModel, j.rawValue)
+                }
+            }
+        }
+        if groups.contains(.legs) {
+            for j: JointName in [.leftKnee, .rightKnee] {
+                guard let cur = m.jointAngles[j], let target = t.jointAngles[j] else { continue }
+                if abs(cur - target) > bands.jointAngle.enter {
+                    return (cur - target, t.cueForModel, j.rawValue)
+                }
             }
         }
         return nil
-    }
-
-    /// Một khớp thuộc nhóm nào (arms hay legs).
-    private static func jointGroup(_ j: JointName) -> PoseGroup {
-        switch j {
-        case .leftKnee, .rightKnee: return .legs
-        case .leftShoulder, .rightShoulder, .leftElbow, .rightElbow: return .arms
-        }
     }
 
     private func fmt(_ v: Double?, _ accept: Double, _ unit: String) -> String {
@@ -1383,19 +1063,17 @@ nonisolated final class GuidanceEngine {
 }
 
 // =====================================================================
-// MARK: - 9. CỔNG CHỤP: DWELL → ĐẾM NGƯỢC → GHI
+// MARK: - 8. CỔNG CHỤP: DWELL → ĐẾM NGƯỢC → GHI
 // =====================================================================
 
-/// Quản lý: đủ 6 mục → giữ ổn định `dwellSeconds` → đếm ngược → ghi NGAY TỪ LÚC ĐẾM.
-nonisolated final class CaptureTrigger {
+final class CaptureTrigger {
     enum State { case guiding, dwelling(since: Double), countingDown(until: Double), recording }
     private(set) var state: State = .guiding
     private var lostAlignedSince: Double?
     private let cfg: GuidanceConfig
 
-    init(config: GuidanceConfig = .default) { self.cfg = config }
+    init(config: GuidanceConfig) { self.cfg = config }
 
-    /// Trả về true tại ĐÚNG frame cần BẮT ĐẦU GHI/CHỤP (ngay khi bắt đầu đếm ngược).
     func update(ready: Bool, now: Double) -> Bool {
         switch state {
         case .guiding:
@@ -1406,7 +1084,7 @@ nonisolated final class CaptureTrigger {
             if !ready { state = .guiding; return false }
             if now - since >= cfg.dwellSeconds {
                 state = .countingDown(until: now + cfg.countdownSeconds)
-                return true                       // ← GHI BẮT ĐẦU TỪ ĐÂY
+                return true
             }
             return false
 
@@ -1431,7 +1109,6 @@ nonisolated final class CaptureTrigger {
         }
         return nil
     }
-
     func reset() { state = .guiding; lostAlignedSince = nil }
 }
 
@@ -1439,13 +1116,12 @@ nonisolated final class CaptureTrigger {
 // MARK: - Tiện ích
 // =====================================================================
 
-nonisolated extension Double {
+extension Double {
     var radians: Double { self * .pi / 180 }
     var degrees: Double { self * 180 / .pi }
 }
 
-/// Hiệu góc có dấu, chuẩn hóa về -180...180 (tránh lỗi khi qua mốc ±180).
-nonisolated func signedAngleDelta(_ a: Double, _ b: Double) -> Double {
+func signedAngleDelta(_ a: Double, _ b: Double) -> Double {
     var d = (a - b).truncatingRemainder(dividingBy: 360)
     if d > 180 { d -= 360 }
     if d < -180 { d += 360 }
