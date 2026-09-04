@@ -24,8 +24,9 @@
 //
 //  Toàn bộ chạy on-device. Không server, không train model.
 //
-
 import SwiftUI
+internal import Combine
+
 import Vision
 import AVFoundation
 import CoreImage
@@ -356,7 +357,7 @@ final class FrameMeasurer {
         guard observations.count > 1 else { return observations.first }
 
         func center(_ obs: VNHumanBodyPoseObservation) -> SIMD2<Double>? {
-            guard let pts = try? obs.recognizedPoints([.leftShoulder, .rightShoulder]),
+            guard let pts = try? obs.recognizedPoints(.all),
                   let l = pts[.leftShoulder], let r = pts[.rightShoulder],
                   l.confidence >= cfg.minKeypointConfidence, r.confidence >= cfg.minKeypointConfidence
             else { return nil }
@@ -689,7 +690,7 @@ final class VideoFrameExtractor {
 
         var out: [ExtractedFrame] = []
         for await result in gen.images(for: times) {
-            if case .success(let img, let requested, _) = result {
+            if case .success(let requested, let img, _) = result {
                 out.append(ExtractedFrame(time: requested.seconds, image: img))
             }
         }

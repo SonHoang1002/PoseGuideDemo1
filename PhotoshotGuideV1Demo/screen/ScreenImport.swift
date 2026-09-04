@@ -5,7 +5,6 @@ import PhotosUI
 /// ScreenImport → Result chỉ cần xoá path là quay về đúng màn ban đầu.
 enum AppRoute: Hashable {
     case camera(referenceImage: UIImage?, properties: [AppliedProperty])
-    case processing(videoURL: URL?, referenceImage: UIImage?)
     case result(videoURL: URL?, frames: [AnalyzedFrame], referenceImage: UIImage?)
 }
 
@@ -60,15 +59,7 @@ struct ScreenImport: View {
                 case let .camera(referenceImage, properties):
                     CameraScreen(
                         referenceImage: referenceImage,
-                        referenceProperties: properties,
-                        onNavigate: { path.append($0) },
-                        onFinish: { path.removeAll() }   // back từ Result → về màn chọn mẫu
-                    )
-                case let .processing(videoURL, referenceImage):
-                    ScreenProcessing(
-                        videoURL: videoURL,
-                        referenceImage: referenceImage,
-                        onNavigate: { path.append($0) }
+                        referenceProperties: properties
                     )
                 case let .result(videoURL, frames, referenceImage):
                     ResultScreen(

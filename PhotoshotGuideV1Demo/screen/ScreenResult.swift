@@ -17,10 +17,7 @@ struct ResultScreen: View {
 
     @State private var frames: [AnalyzedFrame] = []
     @State private var selectedIndex: Int = 0
-    @State private var interval: Double = 0.5
-    @State private var isAnalyzing = false
     @State private var player: AVPlayer?
-    @State private var reanalysisTask: Task<Void, Never>?
     @State private var savedToast = false
     @State private var endObserver: NSObjectProtocol?
 
@@ -36,10 +33,6 @@ struct ResultScreen: View {
                             videoPreview(player)
                         }
 
-                        if videoURL != nil {
-                            intervalSlider
-                        }
-
                         if frames.isEmpty {
                             emptyState
                         } else {
@@ -51,10 +44,6 @@ struct ResultScreen: View {
                 }
 
                 footer
-            }
-
-            if isAnalyzing {
-                analyzingOverlay
             }
 
             if savedToast {
@@ -92,7 +81,6 @@ struct ResultScreen: View {
     }
 
     private func teardown() {
-        reanalysisTask?.cancel()
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
         player?.pause()
     }
@@ -108,44 +96,11 @@ struct ResultScreen: View {
 
             HStack(spacing: 6) {
                 Image(systemName: "film")
-                Text("Video gốc · \(Int(interval * 1000))ms/khung khi trích xuất")
+                Text("Video gốc")
             }
             .font(.system(size: 11, weight: .medium))
             .foregroundColor(.secondary)
             .padding(.horizontal, 4)
-        }
-        .padding(.horizontal, 20)
-    }
-
-    private var intervalSlider: some View {
-        VStack(spacing: 6) {
-            HStack {
-                Label("Khoảng cách trích xuất", systemImage: "slider.horizontal.3")
-                    .font(.system(size: 14, weight: .semibold))
-                Spacer()
-                Text(String(format: "%.1fs", interval))
-                    .font(.system(size: 14, weight: .bold))
-                    .foregroundColor(Color(hex: "2C65E7"))
-                    .monospacedDigit()
-            }
-
-            Slider(
-                value: $interval,
-                in: 0.2...2.0,
-                step: 0.1
-            ) { editing in
-                guard !editing else { return }
-                reanalyze()
-            }
-            .tint(Color(hex: "2C65E7"))
-
-            HStack {
-                Text("0.2s · dày hơn")
-                Spacer()
-                Text("thưa hơn · 2.0s")
-            }
-            .font(.system(size: 10, weight: .medium))
-            .foregroundColor(.secondary)
         }
         .padding(.horizontal, 20)
     }
@@ -184,21 +139,6 @@ struct ResultScreen: View {
         }
         .frame(maxWidth: .infinity)
         .padding(.top, 80)
-    }
-
-    private var analyzingOverlay: some View {
-        VStack(spacing: 10) {
-            ProgressView()
-                .tint(.white)
-            Text("Đang phân tích lại khung hình…")
-                .font(.system(size: 13, weight: .semibold))
-        }
-        .foregroundColor(.white)
-        .padding(.vertical, 14)
-        .padding(.horizontal, 22)
-        .background(Capsule().fill(Color.black.opacity(0.75)))
-        .transition(.opacity)
-        .animation(.easeInOut(duration: 0.2), value: isAnalyzing)
     }
 
     private var toast: some View {
@@ -377,39 +317,37 @@ struct ResultScreen: View {
         UISaveVideoAtPathToSavedPhotosAlbum(videoURL.path, nil, nil, nil)
         savedToast = true
     }
-
-    /// Chạy lại pipeline trích xuất + chấm điểm với khoảng cách mới, rồi cập nhật 5 ảnh tốt nhất.
-    private func reanalyze() {
-        reanalysisTask?.cancel()
-        guard let videoURL else { return }
-
-        isAnalyzing = true
-        let refImage = referenceImage
-        let currentInterval = interval
-
-        reanalysisTask = Task {
-            let newFrames = await FrameAnalysisPipeline.run(
-                videoURL: videoURL,
-                interval: currentInterval,
-                referenceImage: refImage
-            ) { frac in
-                _ = frac
-            }
-
-            await MainActor.run {
-                guard !Task.isCancelled else { return }
-                withAnimation(.easeInOut(duration: 0.25)) {
-                    frames = newFrames
-                    selectedIndex = 0
-                }
-                isAnalyzing = false
-            }
-        }
-    }
 }
 
 #Preview {
     NavigationStack {
         ResultScreen(videoURL: nil, initialFrames: [], referenceImage: nil, onFinish: {})
+    }
+}
+
+// Extension màu HEX (giữ nguyên từ ScreenProcessing bị gỡ bỏ)
+extension Color {
+    init(hex: String) {
+        let hex = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
+        var int: UInt64 = 0
+        Scanner(string: hex).scanHexInt64(&int)
+        let a, r, g, b: UInt64
+        switch hex.count {
+        case 3: // RGB (12-bit)
+            (a, r, g, b) = (255, (int >> 8) * 17, (int >> 4 & 0xF) * 17, (int & 0xF) * 17)
+        case 6: // RGB (24-bit)
+            (a, r, g, b) = (255, int >> 16, int >> 8 & 0xFF, int & 0xFF)
+        case 8: // ARGB (32-bit)
+            (a, r, g, b) = (int >> 24, int >> 16 & 0xFF, int >> 8 & 0xFF, int & 0xFF)
+        default:
+            (a, r, g, b) = (1, 1, 1, 0)
+        }
+        self.init(
+            .sRGB,
+            red: Double(r) / 255,
+            green: Double(g) / 255,
+            blue:  Double(b) / 255,
+            opacity: Double(a) / 255
+        )
     }
 }

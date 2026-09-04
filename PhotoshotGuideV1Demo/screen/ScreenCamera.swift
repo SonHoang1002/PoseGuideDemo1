@@ -8,7 +8,7 @@ internal import Combine
 
 // MARK: - Models
 
-struct AppliedProperty: Identifiable, Equatable {
+struct AppliedProperty: Identifiable, Equatable, Hashable {
     let id = UUID()
     let title: String
 }
@@ -45,6 +45,8 @@ class CameraManager: NSObject, ObservableObject {
     @Published var isRecording = false
     @Published var lastVideoURL: URL?
     @Published var isExtractingFrames = false
+    @Published var extractionProgress: Double = 0
+    @Published var extractionStage = ""
 
     private var photoOutput = AVCapturePhotoOutput()
     private let videoDataOutput = AVCaptureVideoDataOutput()
@@ -336,19 +338,29 @@ extension CameraManager: AVCaptureFileOutputRecordingDelegate {
 
         UISaveVideoAtPathToSavedPhotosAlbum(outputFileURL.path, nil, nil, nil)
 
-        DispatchQueue.main.async { self.isExtractingFrames = true }
+        DispatchQueue.main.async {
+            self.isExtractingFrames = true
+            self.extractionProgress = 0.05
+            self.extractionStage = "Đang phân tích ảnh mẫu"
+        }
         Task {
             let selector = BestShotSelector(config: .default)
             let shots = (try? await selector.selectBestShots(
                 videoURL: outputFileURL,
                 templateImage: referenceCGImage,
                 angularSpeedLog: motionLog
-            )) ?? []
+            ) { [weak self] p, s in
+                Task { @MainActor in
+                    self?.extractionProgress = p
+                    self?.extractionStage = s
+                }
+            }) ?? []
             await MainActor.run {
                 for shot in shots {
                     self.addScoredCapture(ScoredCapture(image: UIImage(cgImage: shot.image), score: shot.score.total))
                 }
                 self.isExtractingFrames = false
+                self.extractionProgress = 1.0
                 try? FileManager.default.removeItem(at: outputFileURL) // temp file cleaned up after extraction
             }
         }
@@ -407,7 +419,10 @@ struct CameraScreen: View {
     @State private var appliedProperties: [AppliedProperty] = []
     @State private var showPreviewGrid: Bool = false
     @State private var showResult: Bool = false
+    @State private var showProcessing: Bool = false
     @State private var showBodyPoints: Bool = true
+    @State private var capturedImage: UIImage?
+    @State private var resultFrames: [AnalyzedFrame] = []
 
     // Changing the sample photo from inside the camera screen
     @State private var showChangeSample = false
@@ -452,7 +467,24 @@ struct CameraScreen: View {
             }
         }
         .navigationDestination(isPresented: $showResult) {
-            ResultScreen(images: cameraManager.topMatches(5))
+            ResultScreen(videoURL: nil, initialFrames: resultFrames,
+                         referenceImage: currentReferenceImage,
+                         onFinish: { showResult = false })
+        }
+        .fullScreenCover(isPresented: $showProcessing, onDismiss: {
+            if !resultFrames.isEmpty { showResult = true }
+        }) {
+            ProcessingView(
+                isVideo: mode == 0,
+                cameraManager: cameraManager,
+                capturedImage: capturedImage,
+                referenceImage: currentReferenceImage,
+                onFinished: { frames in
+                    resultFrames = frames
+                    capturedImage = nil
+                    showProcessing = false
+                }
+            )
         }
     }
 
@@ -614,12 +646,11 @@ struct CameraScreen: View {
         }
     }
 
-    // Finish the session: pick the 5 frames (live burst + taps + video frames) that
-    // matched the reference pose best, and hand them to ResultScreen.
+    // Finish the session: stop recording (if any) and run analysis on what was captured.
     private var doneButton: some View {
         Button {
             if cameraManager.isRecording { cameraManager.stopRecording() }
-            showResult = true
+            showProcessing = true
         } label: {
             Image(systemName: "checkmark.circle.fill")
                 .font(.system(size: 26))
@@ -711,6 +742,7 @@ struct CameraScreen: View {
                 if mode == 0 {
                     if cameraManager.isRecording {
                         cameraManager.stopRecording()
+                        showProcessing = true
                     } else {
                         cameraManager.startRecording()
                     }
@@ -720,8 +752,9 @@ struct CameraScreen: View {
                         DispatchQueue.main.async {
                             cameraManager.lastCapturedImage = image
                             cameraManager.capturedItems.append(image)
+                            capturedImage = image
+                            showProcessing = true
                         }
-                        UIImageWriteToSavedPhotosAlbum(image, nil, nil, nil)
                     }
                 }
             } label: {
@@ -801,6 +834,141 @@ struct PreviewGridView: View {
                 }
             }
             .navigationTitle("Ảnh đã chụp")
+        }
+    }
+}
+
+// MARK: - Processing (phân tích giữa chừng)
+
+struct ProcessingView: View {
+    let isVideo: Bool
+    @ObservedObject var cameraManager: CameraManager
+    let capturedImage: UIImage?
+    let referenceImage: UIImage?
+    let onFinished: ([AnalyzedFrame]) -> Void
+
+    @State private var fakeProgress: Double = 0
+    @State private var didFinish = false
+    @State private var spin = false
+
+    var body: some View {
+        ZStack {
+            Color.white.ignoresSafeArea()
+
+            VStack(spacing: 24) {
+                Spacer()
+
+                ZStack {
+                    Circle()
+                        .fill(
+                            LinearGradient(
+                                colors: [Color(hex: "5B8DEF"), Color(hex: "2C65E7")],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                        .frame(width: 80, height: 80)
+                        .shadow(color: Color.blue.opacity(0.3), radius: 10, x: 0, y: 6)
+
+                    Image(systemName: "wand.and.stars")
+                        .foregroundColor(.white)
+                        .font(.system(size: 36, weight: .medium))
+                }
+                .rotationEffect(.degrees(spin ? 360 : 0))
+                .animation(.linear(duration: 3).repeatForever(autoreverses: false), value: spin)
+
+                Text(isVideo ? "Đang xử lý video" : "Đang phân tích ảnh")
+                    .font(.system(size: 22, weight: .bold))
+                    .foregroundColor(Color(red: 0.1, green: 0.1, blue: 0.15))
+
+                Text(stageText)
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundColor(.secondary)
+
+                VStack(spacing: 10) {
+                    ProgressView(value: progress)
+                        .progressViewStyle(.linear)
+                        .tint(Color(hex: "2C65E7"))
+                        .frame(width: 260)
+
+                    Text("\(Int((progress * 100).rounded()))%")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(Color(hex: "2C65E7"))
+                        .monospacedDigit()
+                }
+
+                Spacer()
+            }
+            .padding(40)
+        }
+        .onAppear {
+            spin = true
+        }
+        .task {
+            await run()
+        }
+    }
+
+    private var progress: Double {
+        isVideo ? cameraManager.extractionProgress : fakeProgress
+    }
+
+    private var stageText: String {
+        if isVideo {
+            return cameraManager.extractionStage.isEmpty ? "Đang phân tích ảnh mẫu" : cameraManager.extractionStage
+        }
+        if fakeProgress < 1 {
+            return "Đang phân tích ảnh mẫu"
+        } else {
+            return "Kiểm tra theo tiêu chí khớp mẫu"
+        }
+    }
+
+    private func run() async {
+        guard !didFinish else { return }
+        didFinish = true
+
+        if isVideo {
+            await waitForVideoExtraction()
+            // Video: lấy 5 ảnh tốt nhất đã chấm trong quá trình quay + trích xuất.
+            var frames: [AnalyzedFrame] = []
+            let images = cameraManager.topMatches(5)
+            frames = images.map { image in
+                AnalyzedFrame(image: image, time: 0, poseScore: 0.5,
+                              quality: ImageQualityAnalyzer.analyze(image: image))
+            }
+            onFinished(frames)
+        } else {
+            // Photo: phân tích 1 ảnh đã chụp.
+            withAnimation(.easeOut(duration: 0.3)) { fakeProgress = 0.6 }
+            await Task.yield()
+            if let image = capturedImage {
+                let frame = AnalyzedFrame(image: image, time: 0, poseScore: 0.5,
+                                          quality: ImageQualityAnalyzer.analyze(image: image))
+                withAnimation(.easeOut(duration: 0.3)) { fakeProgress = 1.0 }
+                try? await Task.sleep(nanoseconds: 300_000_000)
+                onFinished([frame])
+            } else {
+                withAnimation(.easeOut(duration: 0.3)) { fakeProgress = 1.0 }
+                try? await Task.sleep(nanoseconds: 300_000_000)
+                onFinished([])
+            }
+        }
+    }
+
+    private func waitForVideoExtraction() async {
+        // Đợi trích xuất bắt đầu (có thể chưa kịp set true ngay sau stopRecording),
+        // rồi chờ xong. Tối đa 30s để tránh treo mãi nếu thất bại.
+        let start = Date()
+        var sawStart = false
+        while Date().timeIntervalSince(start) < 30 {
+            if cameraManager.isExtractingFrames {
+                sawStart = true
+            }
+            if sawStart && !cameraManager.isExtractingFrames {
+                break
+            }
+            try? await Task.sleep(nanoseconds: 100_000_000)
         }
     }
 }
